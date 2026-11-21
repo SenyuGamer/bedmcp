@@ -1,0 +1,7 @@
+{
+    "name": "BedmcpHot",
+    "entry": "BedmcpHot.dll",
+    "version": "0.1.0",
+    "type": "native",
+    "platform": "client"
+}

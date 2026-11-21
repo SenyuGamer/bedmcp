@@ -1,0 +1,24 @@
+{
+  "//": "Copy to bedmcp.json in your project's root. Every key is optional: without a file bedmcp finds the packs (folders with manifest.json) and the world (the only folder in worlds/) by itself. Paths are relative to this file.",
+
+  "world": "worlds/TestWorld",
+  "behaviorPacks": ["packs/BP"],
+  "resourcePacks": ["packs/RP"],
+
+  "build": [
+    { "cmd": "npm", "args": ["run", "build"], "cwd": "packs/BP" }
+  ],
+
+  "serverProperties": { "gamemode": "survival", "difficulty": "normal" },
+
+  "variants": {
+    "lobby": { "label": "Lobby", "hint": "the lobby map, code in src/lobby", "world": "worlds/Lobby" },
+    "arena": {
+      "label": "Arena",
+      "hint": "the arena map, code in src/arena",
+      "world": "worlds/Arena",
+      "properties": { "view-distance": "8" },
+      "config": { "default/variables.json": { "mode": "ARENA" } }
+    }
+  }
+}

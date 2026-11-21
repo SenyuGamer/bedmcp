@@ -1,0 +1,23 @@
+{
+    "format_version": 2,
+    "header": {
+        "name": "bedmcp bots",
+        "description": "Simulated players driven by bedmcp (test servers only)",
+        "uuid": "d91f22b9-aaa2-4240-bf19-7bf81d6a29c1",
+        "version": [1, 0, 0],
+        "min_engine_version": [1, 21, 0]
+    },
+    "modules": [
+        {
+            "type": "script",
+            "language": "javascript",
+            "uuid": "5a427d59-3262-4980-a5cc-3ab8e0312082",
+            "entry": "scripts/main.js",
+            "version": [1, 0, 0]
+        }
+    ],
+    "dependencies": [
+        { "module_name": "@minecraft/server", "version": "beta" },
+        { "module_name": "@minecraft/server-gametest", "version": "beta" }
+    ]
+}

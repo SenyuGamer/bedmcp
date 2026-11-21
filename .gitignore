@@ -1,0 +1,13 @@
+node_modules/
+# Local install settings (machine paths, the projects of this PC). Use bedmcp.example.json.
+config.json
+# World backups and test output
+backups/
+scripts/out-*
+# Build caches of the client mod (mod/bin is the built mod and is kept)
+mod/build/
+mod/.xmake/
+# Local helper scripts for one project
+scripts/hud.sh
+# Notes about this PC's own install
+LOCAL.md

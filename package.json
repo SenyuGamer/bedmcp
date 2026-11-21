@@ -1,0 +1,33 @@
+{
+  "name": "bedmcp",
+  "version": "0.4.0",
+  "description": "MCP server that tests Minecraft Bedrock add-ons in the real game (Be.D.D. client + LeviLamina test server)",
+  "type": "module",
+  "main": "src/index.mjs",
+  "bin": {
+    "bedmcp": "src/index.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "win32"
+  ],
+  "scripts": {
+    "start": "node src/index.mjs",
+    "tools": "node scripts/try.mjs"
+  },
+  "keywords": [
+    "minecraft",
+    "bedrock",
+    "mcp",
+    "claude",
+    "testing",
+    "levilamina"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^3.25.76"
+  },
+  "license": "MIT"
+}

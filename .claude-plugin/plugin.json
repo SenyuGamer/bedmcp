@@ -1,0 +1,26 @@
+{
+  "name": "bedmcp",
+  "description": "Test Minecraft Bedrock add-ons in the real game: Claude runs a background client and a test server, rebuilds your packs, rejoins, reads the screen, clicks menus, moves the player, runs commands and adds bot players.",
+  "author": {
+    "name": "SenyuGamer"
+  },
+  "homepage": "https://github.com/SenyuGamer/bedmcp",
+  "repository": "https://github.com/SenyuGamer/bedmcp",
+  "keywords": [
+    "minecraft",
+    "bedrock",
+    "add-on",
+    "testing",
+    "mcp",
+    "levilamina"
+  ],
+  "mcpServers": {
+    "bedmcp": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/src/index.mjs"
+      ]
+    }
+  },
+  "license": "MIT"
+}

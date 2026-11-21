@@ -1,0 +1,12 @@
+{
+  "name": "bedmcp",
+  "owner": { "name": "SenyuGamer" },
+  "description": "bedmcp: test Minecraft Bedrock add-ons in the real game from Claude Code.",
+  "plugins": [
+    {
+      "name": "bedmcp",
+      "source": "./",
+      "description": "Real-game test loop for Minecraft Bedrock add-ons (Windows, Be.D.D. + LeviLamina)."
+    }
+  ]
+}
