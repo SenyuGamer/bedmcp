@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { createRecorder } from './record.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const expandEnv = (s) => (typeof s === 'string' ? s.replace(/%([^%]+)%/g, (_, k) => process.env[k] ?? `%${k}%`) : s);
@@ -1251,6 +1252,21 @@ reg('dev_cycle', 'The test loop in one call on this session\'s own client and se
 
 // --- seeing
 reg('screenshot', 'Screenshot of this session\'s game (works while the window is hidden). Returns an image.', { maxWidth: num.optional(), region: z.object({ x: num, y: num, w: num, h: num }).optional(), format: z.enum(['jpeg', 'png']).optional() }, async (a) => ({ content: [await screenshotContent(a)] }));
+// --- video: screenshots in a loop, encoded by ffmpeg (src/record.mjs)
+const recorder = createRecorder({ call, log, outDir: expandEnv(cfg.recordDir ?? join(STATE, 'recordings')), ffmpeg: expandEnv(cfg.ffmpeg ?? 'ffmpeg') });
+reg('record', 'Record a video (MP4 or GIF) of this session\'s game, for the user to watch. ONLY when the user asks for a video or recording; screenshots are enough otherwise. "clip" records `seconds` and returns the file; "start" records in the background while you act with other tools (move, ui_click, bot, dev_cycle ...), then "stop" returns the file; "status" tells what is recording. Frames are captured from the game itself, so it works with the window hidden and the monitor off: ~25-30 fps captured (about 20+ distinct fps while moving, measured), no sound. Needs ffmpeg. Give the returned file to the user (e.g. send it as a file).', {
+  action: z.enum(['clip', 'start', 'stop', 'status']),
+  seconds: num.optional().describe('clip: length; start: the most it records before stopping by itself (default 60, max 600)'),
+  fps: num.optional().describe('frames per second to capture (default 30, max 30)'),
+  format: z.enum(['mp4', 'gif']).optional().describe('mp4 (default) or gif (small, max 15 fps, 640 px wide)'),
+  maxWidth: num.optional().describe('frame width in pixels (default 1280)'),
+  name: z.string().optional().describe('a short name for the file, e.g. "shop-form"'),
+}, async (a) => {
+  if (a.action === 'status') return text(recorder.status());
+  if (a.action === 'stop') return text(await recorder.stop());
+  if (!(await findGame())) throw new Error('this session\'s game is not running: game_launch or dev_cycle first');
+  return text(a.action === 'clip' ? await recorder.clip(a) : await recorder.start(a));
+});
 reg('ui_read', 'Read the screen in front as text: controls with refs like [e1]. Covers menus, forms of the server (action/modal forms), chat, inventory screens. The HUD of in-game play is not read: use screenshot for that.', { find: z.string().optional(), ref: z.string().optional(), scope: z.string().optional(), maxNodes: num.optional() }, async (a) => {
   const r = await call('ui', a);
   return text(r.view ?? r);
@@ -1397,6 +1413,272 @@ reg('bot', 'Simulated players (GameTest) on the test server of this session, to 
   const q = { ...a };
   const t = a.op === 'move' && a.wait ? (a.timeoutSec ?? 20) * 1000 + 5000 : a.op === 'attack' ? 5000 + (a.count ?? 1) * 600 : a.op === 'use' || a.op === 'break' ? 5000 + (a.holdTicks ?? 0) * 50 : 10000;
   return text(await botCall(q, t));
+});
+
+// ---------------------------------------------------------------- walking, aiming, sequences
+// The real client walks like a player: it turns toward the target and holds "forward", correcting
+// several times a second and jumping when it stops making progress. Straight line, no path search.
+const EYE = 1.62;
+const toVec = (p) => (Array.isArray(p) ? { x: +p[0], y: +p[1], z: +p[2] } : p);
+async function myEye() {
+  const w = await worldState();
+  if (!w.inLevel || !w.player?.eye) throw new Error('the client is not in a world');
+  return { eye: w.player.eye, rot: w.player.rot, world: w };
+}
+// A target is [x, y, z] or a bot-pack target ("@client" is not useful here: a player/bot name,
+// an entity id, or a type like "minecraft:zombie", the nearest to this session's player).
+async function locate(t) {
+  if (Array.isArray(t) || (t && typeof t === 'object')) { const v = toVec(t); return { at: v, eye: { ...v, y: v.y + 0.5 } }; }
+  const r = await botCall({ op: 'locate', target: t, from: me.player ?? undefined }, 6000);
+  return { at: r.at, eye: r.eye, who: { type: r.type, id: r.id, name: r.name } };
+}
+const aim = (from, to) => {
+  const d = { x: to.x - from.x, y: to.y - from.y, z: to.z - from.z };
+  return { yaw: (Math.atan2(-d.x, d.z) * 180) / Math.PI, pitch: (-Math.atan2(d.y, Math.hypot(d.x, d.z)) * 180) / Math.PI };
+};
+async function lookAt(t) {
+  const [{ eye }, tgt] = await Promise.all([myEye(), locate(t)]);
+  const a = aim(eye, tgt.eye);
+  await call('look', a);
+  return { ...a, target: tgt.who ?? tgt.at };
+}
+async function walkTo(t, { within = 1.3, sprint = false, timeoutSec = 30, closeScreens = false } = {}) {
+  const started = Date.now(), end = started + timeoutSec * 1000;
+  let tgt = await locate(t), lastLocate = Date.now();
+  let best = Infinity, bestAt = Date.now(), jumps = 0, dist = Infinity, eye, blockedBy = null, closed = [];
+  try {
+    while (Date.now() < end) {
+      if (typeof t === 'string' && Date.now() - lastLocate > 500) { tgt = await locate(t); lastLocate = Date.now(); } // a moving target
+      let w;
+      ({ eye, world: w } = await myEye());
+      // A screen (a server form, a menu) takes the input: close it, or stop and say which.
+      if (w.showingMenu || (w.topScreen && !/hud_screen/.test(w.topScreen))) {
+        if (closeScreens && closed.length < 5) { closed.push(w.topScreen); await call('key', { key: 'ESC' }); await sleep(400); bestAt = Date.now(); continue; }
+        blockedBy = w.topScreen ?? 'a menu'; break;
+      }
+      dist = Math.hypot(tgt.at.x - eye.x, tgt.at.z - eye.z);
+      if (dist <= within) break;
+      if (dist < best - 0.15) { best = dist; bestAt = Date.now(); }
+      const stuck = Date.now() - bestAt > 700;
+      if (stuck) { jumps++; bestAt = Date.now(); }
+      if (jumps > 8 && Date.now() - started > 6000 && best > within * 3) break; // a wall: give up early
+      const { yaw } = aim(eye, tgt.eye);
+      await call('look', { yaw, pitch: 0 });
+      // Slow down near the end: speed effects (a game's own perks) would overshoot the target.
+      const near = dist < within + 2.5;
+      await call('input', { move: { x: 0, z: near ? Math.max(0.25, Math.min(1, (dist - within) / 2.5)) : 1 }, sprint: sprint && !near, jump: stuck, ttlMs: near ? 150 : 350 });
+      await sleep(near ? 60 : 120);
+    }
+  } finally {
+    await call('input', { move: { x: 0, z: 0 }, ttlMs: 50 }).catch(() => {});
+  }
+  const feet = eye ? { x: +eye.x.toFixed(2), y: +(eye.y - EYE).toFixed(2), z: +eye.z.toFixed(2) } : null;
+  return { arrived: dist <= within, distance: +dist.toFixed(2), seconds: +((Date.now() - started) / 1000).toFixed(1), jumps, at: feet, target: tgt.who ?? tgt.at, ...(blockedBy ? { blockedBy, note: 'a screen opened and takes the input: close it (key ESC, ui_read + ui_click) or pass closeScreens' } : {}), ...(closed.length ? { closedScreens: closed } : {}) };
+}
+async function clearScreen(close) {
+  const w = await worldState();
+  if (!(w.showingMenu || (w.topScreen && !/hud_screen/.test(w.topScreen)))) return null;
+  if (!close) throw new Error(`a screen is open (${w.topScreen}): close it first (key ESC, or ui_read + ui_click), or pass closeScreens`);
+  await call('key', { key: 'ESC' }); await sleep(400);
+  return w.topScreen;
+}
+async function clientAttack(t, count = 1, gapMs = 450, close = false) {
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const closed = await clearScreen(close);
+    if (closed) out.push({ closedScreen: closed });
+    if (t) await lookAt(t);
+    // A simulated left click at the crosshair: Be.D.D.'s button op holds 'attack' but does not hit
+    // entities (verified: no entityHitEntity), the click does.
+    const r = await call('mouse', { action: 'click', button: 'left', rx: 0.5, ry: 0.5 }).catch((e) => ({ error: e.message }));
+    const { id: _i, ok: _o, ...rest } = r; out.push(r.error ? { error: r.error } : rest);
+    if (i < count - 1) await sleep(gapMs);
+  }
+  if (out.every((r) => r.error || r.closedScreen)) throw new Error(`no attack went through: ${JSON.stringify(out)}`);
+  return { clicks: count, results: out };
+}
+
+// The world journal of bedmcp's pack (events of the Script API, tracked positions, TPS).
+async function eventsRead({ since = 0, filter, max = 300 } = {}) {
+  const all = [];
+  let cursor = since, more = true, dropped = 0, on = false;
+  while (more && all.length < max) {
+    const r = await botCall({ op: 'events_read', since: cursor, filter, max: Math.min(120, max - all.length) }, 8000);
+    all.push(...r.events); cursor = r.cursor; more = r.more; dropped = r.dropped; on = r.on;
+    if (!r.events.length && !more) break;
+  }
+  return { on, cursor, more, dropped, events: all };
+}
+const compactEvent = (e) => {
+  const { n, ...rest } = e;
+  return JSON.stringify(rest);
+};
+function summarize(events) {
+  const counts = {};
+  for (const e of events) counts[e.ev] = (counts[e.ev] ?? 0) + 1;
+  return counts;
+}
+const NOISY = /^(perf|pos)$/;
+
+reg('walk_to', 'Walk this session\'s real client to a point or an entity like a player would (turns, holds forward, jumps over small steps; straight line, no path search). target: [x, y, z], a player/bot name, an entity id, or a type like "minecraft:zombie" (the nearest). Returns arrived, distance, time. No teleport: zones, triggers and collisions on the way happen for real.', {
+  target: z.union([xyz, z.string()]),
+  within: num.optional().describe('stop this close, in blocks (default 1.3; use ~2.5 before attacking)'),
+  closeScreens: z.boolean().optional().describe('press ESC on forms or menus that open on the way (default: stop and name the screen)'),
+  sprint: z.boolean().optional(),
+  timeoutSec: num.optional().describe('default 30'),
+}, async (a) => text(await walkTo(a.target, a)));
+
+reg('world_events', 'A journal of what happens on this session\'s server, from the Script API: spawn, remove, die, hurt (damage, cause, attacker, health), hit, pickup, drop, effect, trigger, join/leave, break/place/interact, item use, slot, chat, scriptevent, plus "pos" (tracked entities every few ticks) and "perf" (TPS and tick ms every second). start {track, every} clears and starts it; read {since, filter} returns events as JSON lines (filter: regex on the event name, e.g. "hurt|die"); stop ends it; tps gives TPS and tick times now. sequence uses it by itself.', {
+  action: z.enum(['start', 'read', 'stop', 'tps']),
+  track: z.array(z.string()).optional().describe('start: entities whose position to log: types ("minecraft:zombie"), player/bot names or ids'),
+  every: num.optional().describe('start: ticks between tracked positions (default 10)'),
+  perfEvery: num.optional().describe('start: ticks between perf events (default 20, 0 = off)'),
+  since: num.optional().describe('read: the cursor from the previous read or start'),
+  filter: z.string().optional(),
+  max: num.optional().describe('read: most events (default 300)'),
+  seconds: num.optional().describe('tps: window (default 5)'),
+}, async (a) => {
+  if (a.action === 'start') return text(await botCall({ op: 'events_start', track: a.track, every: a.every, perfEvery: a.perfEvery }, 6000));
+  if (a.action === 'stop') return text(await botCall({ op: 'events_stop' }, 6000));
+  if (a.action === 'tps') return text(await botCall({ op: 'tps', seconds: a.seconds }, 6000));
+  const r = await eventsRead(a);
+  return text(`cursor=${r.cursor} on=${r.on} more=${r.more} dropped=${r.dropped} counts=${JSON.stringify(summarize(r.events))}\n${r.events.map(compactEvent).join('\n') || '(no events)'}`);
+});
+
+// Script profiler of the test server (BDS "script profiler start|stop"): writes a .cpuprofile of the
+// scripts' CPU time; bedmcp sums self time per function so the hot spots read as a list.
+function cpuProfileTop(file, top = 25) {
+  const p = JSON.parse(readFileSync(file, 'utf8'));
+  const nodes = new Map(p.nodes.map((n) => [n.id, n]));
+  const self = new Map();
+  const deltas = p.timeDeltas ?? [];
+  (p.samples ?? []).forEach((id, i) => self.set(id, (self.get(id) ?? 0) + (deltas[i] ?? 0)));
+  const total = [...self.values()].reduce((a, b) => a + b, 0) || 1;
+  const byFn = new Map();
+  for (const [id, us] of self) {
+    const cf = nodes.get(id)?.callFrame ?? {};
+    const where = cf.url ? cf.url.split(/[\\/]/).filter(Boolean).slice(-3).join('/') : '';
+    const key = `${(cf.functionName || '(anonymous)').split('\n')[0]} ${where ? `${where}:${(cf.lineNumber ?? 0) + 1}` : ''}`.trim();
+    byFn.set(key, (byFn.get(key) ?? 0) + us);
+  }
+  // The runtime's scheduler loop (scheduling.js) and idle/program samples are time the scripts
+  // did not use: 'busyPct' is a function's share of the scripts' own time.
+  const IDLE = /scheduling\.js|^\((idle|program|root)\)/;
+  const busy = [...byFn.entries()].filter(([k]) => !IDLE.test(k)).reduce((a, [, us]) => a + us, 0) || 1;
+  const rows = [...byFn.entries()].sort((a, b) => b[1] - a[1]).slice(0, top).map(([fn, us]) => ({ fn, ms: +(us / 1000).toFixed(1), pct: +((us / total) * 100).toFixed(1), ...(IDLE.test(fn) ? { idle: true } : { busyPct: +((us / busy) * 100).toFixed(1) }) }));
+  return { file, totalMs: +(total / 1000).toFixed(1), scriptsBusyMs: +(busy / 1000).toFixed(1), samples: (p.samples ?? []).length, top: rows };
+}
+function newestProfile(dir, after) {
+  let best = null;
+  const walk = (d, depth) => {
+    if (depth < 0) return;
+    let entries = [];
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) { if (!['worlds', 'behavior_packs', 'resource_packs', 'development_behavior_packs', 'development_resource_packs', 'plugins', 'definitions'].includes(e.name)) walk(p, depth - 1); }
+      else if (e.name.endsWith('.cpuprofile')) { const m = statSync(p).mtimeMs; if (m >= after && (!best || m > best.m)) best = { p, m }; }
+    }
+  };
+  walk(dir, 3);
+  return best?.p ?? null;
+}
+let profilerStarted = 0;
+async function profilerStart() { profilerStarted = Date.now() - 1000; return serverCommand('script profiler start', { waitMs: 3000 }); }
+async function profilerStop() {
+  const s = await srv();
+  const out = await serverCommand('script profiler stop', { waitMs: 5000 });
+  let file = (out.match(/[A-Za-z]:[^"\r\n]*?\.cpuprofile/) ?? [])[0] ?? null;
+  for (let i = 0; i < 20 && !(file && existsSync(file)); i++) { await sleep(300); file = newestProfile(s.dir, profilerStarted); }
+  if (!file) return { output: out, note: `no .cpuprofile found under ${s.dir}` };
+  return { output: out.split('\n').slice(0, 3).join(' '), ...cpuProfileTop(file) };
+}
+reg('profiler', 'Script CPU profiler of this session\'s test server ("script profiler start/stop"): start, do the thing to measure (dev_cycle, sequence, bots ...), stop: returns the .cpuprofile file and the functions that took the most time (self time, ms and %). Open the file in Chrome DevTools or VS Code for the full view.', {
+  action: z.enum(['start', 'stop']),
+  top: num.optional().describe('stop: how many functions to list (default 25)'),
+}, async (a) => text(a.action === 'start' ? await profilerStart() : await profilerStop()));
+
+// A list of steps run in order by bedmcp, without a round trip per step. Each step is an object with
+// one action key. The world journal runs meanwhile; each step's result lists what happened.
+let seqCloseScreens = false;
+const STEP_KEYS = ['walk_to', 'look_at', 'look', 'attack', 'use', 'wait', 'screenshot', 'ui_read', 'ui_click', 'key', 'command', 'chat', 'bot', 'hotbar', 'jump', 'move', 'tps', 'events'];
+async function runStep(st) {
+  const key = STEP_KEYS.find((k) => st[k] !== undefined);
+  if (!key) throw new Error(`a step needs one of: ${STEP_KEYS.join(', ')}`);
+  const v = st[key];
+  switch (key) {
+    case 'walk_to': return walkTo(v, { within: st.within, sprint: st.sprint, timeoutSec: st.timeoutSec, closeScreens: st.closeScreens ?? seqCloseScreens });
+    case 'look_at': return lookAt(v);
+    case 'look': return call('look', v);
+    case 'attack': return typeof v === 'object' ? clientAttack(v.target, v.count ?? 1, v.gapMs, seqCloseScreens) : clientAttack(st.target, typeof v === 'number' ? v : 1, 450, seqCloseScreens);
+    case 'use': { await clearScreen(seqCloseScreens); if (v?.target) await lookAt(v.target); return call('button', { button: 'use', action: 'click' }); }
+    case 'wait': await sleep(Math.min(+v, 120) * 1000); return { waited: +v };
+    case 'screenshot': return { screenshot: typeof v === 'string' ? v : true };
+    case 'ui_read': return { view: (await call('ui', {})).view };
+    case 'ui_click': return call('ui', { action: 'click', ref: v });
+    case 'key': return call('key', typeof v === 'string' ? { key: v } : v);
+    case 'command': return { output: await serverCommand(v, { waitMs: st.waitMs ?? 1500 }) };
+    case 'chat': { await call('key', { key: 'T' }); await sleep(400); await call('text', { text: v }); await sleep(150); await call('key', { key: 'ENTER' }); return { said: v }; }
+    case 'bot': return botCall(v, v.op === 'move' && v.wait ? (v.timeoutSec ?? 20) * 1000 + 5000 : 15000);
+    case 'hotbar': return call('slot', { slot: v });
+    case 'jump': return call('input', { jump: true, ttlMs: 200 });
+    case 'move': { const r = await call('input', { move: { x: v.x ?? 0, z: v.z ?? 0 }, jump: v.jump, sprint: v.sprint, sneak: v.sneak, ttlMs: v.ms ?? 1000 }); await sleep((v.ms ?? 1000) + 100); return r; }
+    case 'tps': return botCall({ op: 'tps', seconds: typeof v === 'number' ? v : 5 }, 6000);
+    case 'events': return { events: (await eventsRead({ filter: typeof v === 'string' ? v : undefined })).events.length };
+  }
+}
+reg('sequence', 'Run several steps in a row on this session\'s client, in one call: e.g. walk to A, look at a mob, attack 3 times, wait, screenshot, walk to B, read a form. Steps (one key each): walk_to (target, with optional within/sprint/timeoutSec), look_at (target), look {yaw,pitch}, attack (count, with target; or {target,count}), use (true or {target}), wait (seconds), screenshot ("label"), ui_read, ui_click (ref), key, command (server command), chat (client chat line), bot ({op, ...} as the bot tool), hotbar (slot), jump, move {x,z,ms}, tps. Targets: [x,y,z], a player/bot name, an entity id or a type ("minecraft:zombie"). While it runs, the world journal records what happens: each step returns its events (hurt, die, spawn, pickup ...), and the end lists TPS, server errors and, with record, a video file. Stops at the first failing step unless continueOnError.', {
+  steps: z.array(z.record(z.any())).min(1).max(100),
+  record: z.union([z.boolean(), z.enum(['mp4', 'gif'])]).optional().describe('record the whole sequence as a video (true = mp4)'),
+  name: z.string().optional().describe('a short name (video file)'),
+  track: z.array(z.string()).optional().describe('entities whose positions the journal logs (types, names or ids)'),
+  eventsPerStep: num.optional().describe('most events listed per step (default 25; counts are always complete)'),
+  continueOnError: z.boolean().optional(),
+  closeScreens: z.boolean().optional().describe('walk_to steps press ESC on forms or menus that open on the way (default false: the step fails and names the screen)'),
+}, async (a) => {
+  seqCloseScreens = !!a.closeScreens;
+  const s = await srv();
+  if (!(await findGame())) throw new Error('this session\'s game is not running: dev_cycle first');
+  const logFrom = readLog(s.dir).length;
+  let journalOk = true, cursor = 0;
+  try { cursor = (await botCall({ op: 'events_start', track: a.track, perfEvery: 20 }, 6000)).cursor; } catch (e) { journalOk = false; log('journal:', e.message); }
+  if (a.record) await recorder.start({ name: a.name ?? 'sequence', seconds: 600, format: a.record === 'gif' ? 'gif' : 'mp4' });
+  const results = [], shots = [];
+  let failed = null;
+  const t0 = Date.now();
+  for (let i = 0; i < a.steps.length; i++) {
+    const st = a.steps[i], ts = Date.now();
+    let out, ok = true;
+    try { out = await runStep(st); } catch (e) { ok = false; out = { error: e.message }; }
+    if (out?.arrived === false) ok = false; // walk_to did not get there
+    if (st.screenshot !== undefined && ok) { try { shots.push({ label: typeof st.screenshot === 'string' ? st.screenshot : `step ${i + 1}`, img: await screenshotContent({ maxWidth: 960 }) }); } catch (e) { out = { error: e.message }; } }
+    const row = { step: i + 1, do: st, ok, ms: Date.now() - ts, result: out };
+    if (journalOk) {
+      try {
+        await sleep(150);
+        const r = await eventsRead({ since: cursor });
+        cursor = r.cursor;
+        const ev = r.events.filter((e) => !NOISY.test(e.ev));
+        row.events = { counts: summarize(r.events), list: ev.slice(0, a.eventsPerStep ?? 25).map(compactEvent) };
+        const perf = r.events.filter((e) => e.ev === 'perf' && e.tps);
+        if (perf.length) row.tps = Math.min(...perf.map((e) => e.tps));
+        const pos = r.events.filter((e) => e.ev === 'pos');
+        if (pos.length) row.tracked = pos.slice(-5).map(compactEvent);
+      } catch (e) { row.events = { error: e.message }; }
+    }
+    results.push(row);
+    if (!ok && !a.continueOnError) { failed = i + 1; break; }
+  }
+  let video = null;
+  if (a.record) { try { video = await recorder.stop(); } catch (e) { video = { error: e.message }; } }
+  let perf = null;
+  if (journalOk) { try { perf = await botCall({ op: 'tps', seconds: Math.min(60, Math.ceil((Date.now() - t0) / 1000)) }, 6000); } catch {} }
+  await sleep(800); // LeviLamina buffers latest.log a little
+  const errors = readLog(s.dir).slice(logFrom).map((l) => l.line).filter((l) => /ERROR|ERR\]|\[Scripting\].*(error|Error)|Exception/.test(l)).slice(-30);
+  const summary = { steps: a.steps.length, ran: results.length, failedAt: failed, seconds: +((Date.now() - t0) / 1000).toFixed(1), perf, serverErrors: errors.length ? errors : 'none', video, journal: journalOk ? 'on' : 'off (bot pack not answering: server_restart installs it)' };
+  const content = [{ type: 'text', text: JSON.stringify({ summary, results }, null, 1) }];
+  for (const sh of shots) content.push({ type: 'text', text: `screenshot: ${sh.label}` }, sh.img);
+  return { content };
 });
 
 reg('entities', 'List entities with position via the server ("querytarget"), around this session\'s player. selector example: @e[type=minecraft:zombie,r=30] or @e[family=mob]. Positions are relative to the player when r= is used.', { selector: z.string().optional(), player: z.string().optional() }, async ({ selector = '@e[r=32]', player }) => {

@@ -49,6 +49,22 @@ Facts behind the table:
 - Act: `ui_click`, `ui_type`, `ui_scroll`, `move`, `look`, `teleport`, `interact_block`, `hotbar`, `mouse_button`, `key`, `client_chat`, `server_command` (as the server: `execute as <player> at @s run ...`).
 - Prefer `ui_read` + `ui_click` over screenshots and pixel clicks: exact and cheap.
 
+## Scenarios: sequence + world journal
+
+To test something that happens over several actions (walk somewhere, hit a mob, open a shop, come back), prefer ONE `sequence` call over many single tools, and walk (`walk_to`) instead of teleporting when the way matters (zones, triggers, collisions).
+- `sequence {closeScreens:true, track:["minecraft:zombie"], steps:[{walk_to:"minecraft:zombie", within:2.3}, {attack:{target:"minecraft:zombie", count:3}}, {screenshot:"after"}, {walk_to:[x,y,z]}, {tps:5}]}`.
+- Check the result as data, not only images: each step lists its world events (`hurt` with damage, cause and attacker, `die`, `spawn`, `pickup`, `drop`, `effect`, `hit` ...), `tracked` positions, and the TPS; the summary has the server errors. A `hit` with no `hurt` means the game cancelled the damage.
+- `walk_to` is a straight line (no path finding): if it reports `arrived:false`, split the way into points. A form that opens stops it unless `closeScreens`.
+- Use `world_events {action:"start", track:[...]}` / `read {since, filter:"hurt|die"}` for things you do with other tools, and `profiler {action:"start"}` ... `{action:"stop"}` to find the scripts' hot spots.
+
+## Video (only when the user asks)
+
+Record a video ONLY when the user asks for one (a video, a recording, a clip, "show me it moving"); screenshots are enough otherwise.
+- `record {action:"clip", seconds:10}`: records and returns an MP4.
+- `record {action:"start", seconds:60}`, then act (`move`, `ui_click`, `bot`, `dev_cycle` ...), then `record {action:"stop"}`: records what you do.
+- `format:"gif"` for a small looping clip. About 28 fps, no sound; works with the window hidden and the monitor off.
+- Give the file to the user (send it as a file when the chat can, else say its path).
+
 ## Second player: bots
 
 Only one real client per session can join a server (all clients share one Microsoft account). For multiplayer logic, `bot` adds GameTest simulated players next to your client: to the scripts they are real `Player`s (they can be hit, die, carry items, chat, run commands).

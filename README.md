@@ -9,7 +9,10 @@ Server + [LeviLamina](https://github.com/LiteLDev/LeviLamina)). Claude can then:
 - rebuild your packs, reload scripts and rejoin the world in about 10 s;
 - read the screen as text, click menus and forms, type, take screenshots;
 - move, look, use items and blocks, run server commands, read the logs;
-- add bot players (GameTest simulated players) to test multiplayer logic with one client.
+- add bot players (GameTest simulated players) to test multiplayer logic with one client;
+- run a whole scenario in one call (walk to A, hit a mob, walk to B, read a form ...) while a
+  journal records what happens in the world (spawns, damage, deaths, items, positions, TPS);
+- profile the scripts and record videos of the game.
 
 Each Claude session gets its own client, its own server and its own copy of your world, so several
 chats can test at once. Your project's files and world are never changed.
@@ -19,6 +22,7 @@ It also ships a skill, `live-test`, that tells Claude which cycle to use for whi
 ## Requirements
 
 - **Windows 10/11** and **Node.js 22+**.
+- Optional: **[ffmpeg](https://ffmpeg.org)** on PATH for video recording (`winget install Gyan.FFmpeg`).
 - **Minecraft Bedrock 1.26.60 (GDK)**, owned and signed in.
 - **[LeviLauncher](https://github.com/LiteLDev/LeviLauncher) 1.1+**, with an instance of 1.26.60 that
   has **LeviLamina 26.60.x**. Start it once and sign in.
@@ -104,15 +108,19 @@ points to one file instead):
 | `server` | `{ "name": "bedmcp", "port": 19140 }`; slot N uses `bedmcp-N` and port 19140 + 2(N-1) |
 | `hotMod` | `true` (BedmcpHot, below) |
 | `bots` | `true` (the bot pack) |
+| `ffmpeg` | `ffmpeg` on PATH (for `record`) |
+| `recordDir` | `stateDir\recordings` |
 | `projects` | `{ "<folder>": { ...bedmcp.json keys } }`, for projects you can't add a file to |
 
 ## Tools
 
 - Setup: `setup_check`, `server_sessions`
 - Loop: `dev_cycle` (build, reload, leave, rejoin, screenshot)
+- Scenarios: `sequence` (many steps in one call), `walk_to` (walk like a player, no teleport)
+- World as data: `world_events` (journal of spawns, damage, deaths, items, positions, TPS), `profiler` (script CPU profile)
 - Server: `server_start`, `server_stop`, `server_restart`, `server_command`, `server_logs`, `build_packs`, `world_import`
 - Client: `game_launch`, `game_stop`, `game_status`, `game_join`, `game_leave`, `session_stop`, `pack_sync`
-- See: `screenshot`, `ui_read`, `wait_for_screen`, `player_state`, `entities`
+- See: `screenshot`, `record` (MP4/GIF video), `ui_read`, `wait_for_screen`, `player_state`, `entities`
 - Act: `ui_click`, `ui_type`, `ui_scroll`, `interact_block`, `teleport`, `look`, `move`, `hotbar`, `mouse_button`, `game_action`, `key`, `type_text`, `mouse`, `client_chat`, `release_input`
 - Multiplayer: `bot`
 - Anything else: `bedd_call` (a raw Be.D.D. WebSocket op)
@@ -151,6 +159,45 @@ cd mod
 xmake f -y -m release -p windows -a x64
 xmake -y
 ```
+
+### Sequences and the world journal
+
+`sequence` runs a list of steps in one call, e.g.
+
+```json
+{ "record": true, "closeScreens": true, "track": ["minecraft:pig", "Rival"], "steps": [
+  { "bot": { "op": "spawn", "name": "Rival" } },
+  { "walk_to": "minecraft:pig", "within": 2.3 },
+  { "attack": { "target": "minecraft:pig", "count": 3 } },
+  { "screenshot": "after the hits" },
+  { "walk_to": [36.5, 101, -6.5], "sprint": true },
+  { "look_at": "Rival" },
+  { "tps": 5 }
+]}
+```
+
+Steps: `walk_to`, `look_at`, `look`, `attack`, `use`, `wait`, `screenshot`, `ui_read`, `ui_click`,
+`key`, `command`, `chat`, `bot`, `hotbar`, `jump`, `move`, `tps`. Targets are `[x, y, z]`, a player or
+bot name, an entity id, or a type (the nearest). `walk_to` turns toward the target and holds forward
+(jumping small steps, slowing down near the end); it is a straight line, not path finding, and it
+reports a form or menu that takes the input (`closeScreens` presses ESC on them). `attack` is a real
+left click at the crosshair.
+
+While a sequence runs, bedmcp's pack keeps a journal of the world from the Script API events (spawn,
+remove, die, hurt with cause and attacker, hit, pickup, drop, effect, entity triggers, join/leave,
+block break/place/interact, item use, chat, scriptevent), the positions of `track`ed entities and the
+TPS. Each step returns the events that happened during it; the end gives the TPS and tick times over
+the run, the server's errors, and the video. `world_events` uses the same journal by hand.
+
+`profiler` runs BDS's script profiler (`script profiler start|stop`) and lists the functions that took
+the most CPU time (the runtime's own scheduler is marked idle).
+
+### Video
+
+`record` captures the game's own frames through Be.D.D. (no screen capture), so it works with the
+window hidden and the monitor off: about 28 fps captured at 1024 px, encoded by ffmpeg to MP4 (H.264)
+or GIF, no sound. `clip` records N seconds; `start`/`stop` records while Claude acts with other tools.
+The skill tells Claude to record only when the user asks for a video.
 
 ## Limits
 

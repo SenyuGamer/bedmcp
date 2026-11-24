@@ -7,7 +7,7 @@
 import { world, system, ItemStack, GameMode, Direction, CommandPermissionLevel, CustomCommandParamType, CustomCommandStatus } from '@minecraft/server';
 import { spawnSimulatedPlayer, SimulatedPlayer, LookDuration } from '@minecraft/server-gametest';
 
-const VERSION = 1;
+const VERSION = 2;
 const bots = new Map(); // name -> SimulatedPlayer
 
 const replies = new Map(); // id -> { tick, text }, taken by /bedmcp:botreply
@@ -15,7 +15,8 @@ function reply(id, body) {
     const text = JSON.stringify(body);
     replies.set(id, { tick: system.currentTick, text });
     for (const [k, v] of replies) if (system.currentTick - v.tick > 20 * 120) replies.delete(k);
-    console.log(`BEDMCPBOT#${id} ${text}`);
+    // The log copy is a fallback for small replies only (journal reads would flood the log).
+    if (text.length < 1500) console.log(`BEDMCPBOT#${id} ${text}`);
 }
 system.beforeEvents.startup.subscribe(({ customCommandRegistry }) => {
     customCommandRegistry.registerCommand(
@@ -250,7 +251,124 @@ const ops = {
         const r = b.runCommand(String(q.command ?? '').replace(/^\//, ''));
         return { successCount: r.successCount, bot: state(b) };
     },
+
+    // Where an entity is: feet and eyes (for walking to it and aiming at it).
+    locate(q) {
+        const e = entity(q.target, q.from ? entity(q.from) : realPlayers()[0]);
+        let eye = e.location;
+        try { eye = e.getHeadLocation(); } catch {}
+        return { ...other(e), dimension: e.dimension.id.replace('minecraft:', ''), eye: v3(eye) };
+    },
+
+    // --- world journal: what happens in the world, as events, read back by bedmcp
+    events_start(q) {
+        journal.on = true;
+        journal.track = (q.track ?? []).map(String);
+        journal.every = Math.max(1, q.every ?? 10);
+        journal.perfEvery = Math.max(0, q.perfEvery ?? 20);
+        if (q.clear !== false) { journal.buf = []; journal.dropped = 0; }
+        return { on: true, cursor: journal.seq, track: journal.track, every: journal.every, perfEvery: journal.perfEvery };
+    },
+    events_stop() { journal.on = false; return { on: false, cursor: journal.seq, buffered: journal.buf.length }; },
+    events_read(q) {
+        const since = q.since ?? 0, max = Math.min(q.max ?? 120, 400);
+        const re = q.filter ? new RegExp(q.filter, 'i') : null;
+        const out = [];
+        let last = since;
+        for (const e of journal.buf) {
+            if (e.n <= since) continue;
+            last = e.n;
+            if (re && !re.test(e.ev)) continue;
+            out.push(e);
+            if (out.length >= max) break;
+        }
+        const more = journal.buf.some((e) => e.n > last);
+        return { on: journal.on, cursor: last, more, dropped: journal.dropped, events: out };
+    },
+    // Ticks per second and tick times over the last `seconds` (default 5).
+    tps(q) { return perfOf(Math.min(Math.max(q.seconds ?? 5, 1), 60)); },
 };
+
+// ---------------------------------------------------------------- world journal
+const journal = { on: false, seq: 0, buf: [], dropped: 0, max: 6000, track: [], every: 10, perfEvery: 20 };
+const at3 = (v) => [Math.round(v.x * 10) / 10, Math.round(v.y * 10) / 10, Math.round(v.z * 10) / 10];
+function who(e) {
+    if (!e) return undefined;
+    try {
+        if (!e.isValid) return { id: e.id };
+        const d = { type: e.typeId.replace('minecraft:', ''), id: e.id, at: at3(e.location) };
+        const name = e.name ?? e.nameTag;
+        if (name) d.name = name;
+        if (isBot(e)) d.bot = true;
+        return d;
+    } catch { return undefined; }
+}
+function note(ev, data) {
+    if (!journal.on) return;
+    journal.buf.push({ n: ++journal.seq, t: system.currentTick, ev, ...data });
+    if (journal.buf.length > journal.max) { journal.buf.shift(); journal.dropped++; }
+}
+const on = (name, fn) => { try { world.afterEvents[name]?.subscribe((e) => { if (journal.on) try { fn(e); } catch {} }); } catch {} };
+const blockAt = (b) => { try { return { block: b.typeId.replace('minecraft:', ''), at: [b.location.x, b.location.y, b.location.z] }; } catch { return {}; } };
+on('entitySpawn', (e) => note('spawn', { e: who(e.entity), cause: e.cause }));
+on('entityRemove', (e) => note('remove', { e: { id: e.removedEntityId, type: e.typeId?.replace('minecraft:', '') } }));
+on('entityDie', (e) => note('die', { e: who(e.deadEntity), by: who(e.damageSource?.damagingEntity), cause: e.damageSource?.cause }));
+on('entityHurt', (e) => note('hurt', { e: who(e.hurtEntity), by: who(e.damageSource?.damagingEntity), cause: e.damageSource?.cause, dmg: Math.round(e.damage * 100) / 100, hp: hp(e.hurtEntity) }));
+on('entityHitEntity', (e) => note('hit', { by: who(e.damagingEntity), e: who(e.hitEntity) }));
+on('entityHitBlock', (e) => note('hit_block', { by: who(e.damagingEntity), ...blockAt(e.hitBlock) }));
+on('entityItemPickup', (e) => note('pickup', { e: who(e.entity), items: e.items?.map?.((i) => `${i.typeId}x${i.amount}`) }));
+on('entityItemDrop', (e) => note('drop', { e: who(e.entity), items: e.items?.map?.((i) => `${i.typeId}x${i.amount}`) }));
+on('projectileHitEntity', (e) => note('projectile_hit', { by: who(e.source), projectile: e.projectile?.typeId }));
+on('effectAdd', (e) => note('effect', { e: who(e.entity), effect: e.effect?.typeId, amp: e.effect?.amplifier, ticks: e.effect?.duration }));
+on('dataDrivenEntityTrigger', (e) => note('trigger', { e: who(e.entity), event: e.eventId }));
+on('explosion', (e) => note('explosion', { by: who(e.source), blocks: e.getImpactedBlocks?.().length }));
+on('playerJoin', (e) => note('join', { name: e.playerName, id: e.playerId }));
+on('playerLeave', (e) => note('leave', { name: e.playerName, id: e.playerId }));
+on('playerSpawn', (e) => note('player_spawn', { e: who(e.player), initial: e.initialSpawn }));
+on('playerDimensionChange', (e) => note('dimension', { e: who(e.player), from: e.fromDimension?.id, to: e.toDimension?.id }));
+on('playerBreakBlock', (e) => note('break', { e: who(e.player), block: e.brokenBlockPermutation?.type?.id?.replace('minecraft:', ''), at: [e.block.location.x, e.block.location.y, e.block.location.z] }));
+on('playerPlaceBlock', (e) => note('place', { e: who(e.player), ...blockAt(e.block) }));
+on('playerInteractWithBlock', (e) => note('interact_block', { e: who(e.player), ...blockAt(e.block), item: e.itemStack?.typeId }));
+on('playerInteractWithEntity', (e) => note('interact', { e: who(e.player), target: who(e.target), item: e.itemStack?.typeId }));
+on('itemUse', (e) => note('use', { e: who(e.source), item: e.itemStack?.typeId }));
+on('playerHotbarSelectedSlotChange', (e) => note('slot', { e: who(e.player), slot: e.newSlotSelected, item: e.itemStack?.typeId }));
+on('playerGameModeChange', (e) => note('gamemode', { e: who(e.player), to: e.toGameMode }));
+on('chatSend', (e) => note('chat', { e: who(e.sender), message: e.message }));
+on('weatherChange', (e) => note('weather', { to: e.newWeather }));
+system.afterEvents.scriptEventReceive.subscribe((e) => { if (journal.on && e.id !== 'bedmcp:bot') note('scriptevent', { id: e.id, message: e.message?.slice(0, 200), by: who(e.sourceEntity) }); });
+
+// Tick timing: wall time of every tick, for TPS and tick length (MSPT) over the last minute.
+const tickTimes = [];
+system.runInterval(() => {
+    tickTimes.push(Date.now());
+    if (tickTimes.length > 1300) tickTimes.splice(0, tickTimes.length - 1200);
+}, 1);
+function perfOf(seconds) {
+    const now = Date.now(), from = now - seconds * 1000;
+    const ts = tickTimes.filter((t) => t >= from);
+    if (ts.length < 2) return { tps: null, note: 'not enough ticks yet' };
+    const gaps = ts.slice(1).map((t, i) => t - ts[i]);
+    const avg = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+    const sorted = [...gaps].sort((a, b) => a - b);
+    return { seconds, tps: Math.round(((ts.length - 1) / ((ts[ts.length - 1] - ts[0]) / 1000)) * 10) / 10, avgTickMs: Math.round(avg * 10) / 10, p95TickMs: sorted[Math.floor(sorted.length * 0.95)], maxTickMs: sorted[sorted.length - 1], ticks: ts.length };
+}
+// Tracked entities' positions and the TPS, every few ticks, while the journal is on.
+system.runInterval(() => {
+    if (!journal.on) return;
+    const t = system.currentTick;
+    if (journal.perfEvery && t % journal.perfEvery === 0) note('perf', perfOf(1));
+    if (!journal.track.length || t % journal.every !== 0) return;
+    for (const spec of journal.track) {
+        let list = [];
+        try {
+            if (/^-?\d+$/.test(spec)) { const e = world.getEntity(spec); if (e) list = [e]; }
+            else if (spec.includes(':') || !world.getAllPlayers().some((p) => p.name === spec)) {
+                for (const d of ['overworld', 'nether', 'the_end']) list.push(...world.getDimension(d).getEntities({ type: spec.includes(':') ? spec : `minecraft:${spec}` }));
+            } else list = world.getAllPlayers().filter((p) => p.name === spec);
+        } catch {}
+        for (const e of list.slice(0, 20)) note('pos', { e: who(e), rot: (() => { try { return Math.round(e.getRotation().y); } catch { return undefined; } })() });
+    }
+}, 1);
 
 system.afterEvents.scriptEventReceive.subscribe((ev) => {
     if (ev.id !== 'bedmcp:bot') return;
