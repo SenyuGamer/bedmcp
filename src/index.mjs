@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { RootsListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createRecorder } from './record.mjs';
 import { createDebugger } from './debugger.mjs';
 
@@ -40,7 +41,9 @@ const inside = (dir, root) => { const d = normPath(dir), r = normPath(root); ret
 //   sourceDir contains the project folder (or nothing else matched); else the project folder itself,
 //   with its packs and world found by looking.
 // The project folder is CLAUDE_PROJECT_DIR when the host sets it, else the working directory.
-const PROJECT_DIR = resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+let PROJECT_DIR = resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+let PROJECT_SET = false;
+const PROJECT_DIR_FROM = process.env.CLAUDE_PROJECT_DIR ? "CLAUDE_PROJECT_DIR" : "the working directory";
 const USER_DIR = expandEnv(process.env.BEDMCP_HOME || '%USERPROFILE%\\.bedmcp');
 const PROJECT_FILES = ['bedmcp.json', '.bedmcp.json'];
 const MACHINE_KEYS = ['bedd', 'beddHome', 'stateDir', 'slot', 'maxClients', 'exclusiveSignaling', 'worldMode', 'hotMod', 'bots'];
@@ -69,6 +72,7 @@ function projectOf(layer, baseDir) {
   };
 }
 function loadConfig() {
+  CONFIG_SOURCES.length = 0;
   const machine = { server: {} };
   const take = (layer, from) => {
     if (!layer) return;
@@ -116,7 +120,7 @@ const BASE_SLOT = cfg.slot ?? 1;
 const BASE_PORT = cfg.server.port ?? 19140;
 const HOST = cfg.server.host ?? '127.0.0.1';
 // Where the project lives (build steps, packs, the world to copy).
-const SOURCE_DIR = resolve(expandEnv(cfg.server.sourceDir ?? PROJECT_DIR));
+let SOURCE_DIR = resolve(expandEnv(cfg.server.sourceDir ?? PROJECT_DIR));
 const log = (...a) => process.stderr.write(`[bedmcp] ${a.join(' ')}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -177,6 +181,7 @@ const me = {
   lastSeen: Date.now(),
   lastTool: null,
   slot: null,
+  project: SOURCE_DIR, // the project folder this session builds and tests (project param can switch it)
   variant: null, // the project variant this session tests (server.variants), null: the project's own
   server: null,  // this session's server name
   player: null,  // the player name of this session's client on its server
@@ -197,7 +202,7 @@ function sessions() {
   }
   return out;
 }
-const describe = (s) => `${s.name}${s.activity ? ` ("${s.activity}")` : ''} [slot ${s.slot ?? '-'}, server ${s.server ?? '-'}${s.variant ? `, variant ${s.variant}` : ''}, last tool ${s.lastTool ?? '-'} ${ago(s.lastSeen)}]`;
+const describe = (s) => `${s.name}${s.activity ? ` ("${s.activity}")` : ''} [project ${s.project ?? "?"}, slot ${s.slot ?? '-'}, server ${s.server ?? '-'}${s.variant ? `, variant ${s.variant}` : ''}, last tool ${s.lastTool ?? '-'} ${ago(s.lastSeen)}]`;
 
 // A lock folder: mkdir is atomic. A lock of a dead process is taken over.
 async function withLock(name, fn, waitMs = 600000) {
@@ -298,7 +303,7 @@ function levelName(dir) {
 // several games, each its own world, script variables and properties. Each session picks the one it
 // works on; its test server is set up for it (the project folder itself is never changed). With
 // none picked, the variant whose world the project's server.properties names.
-const VARIANTS = cfg.server.variants && Object.keys(cfg.server.variants).length ? cfg.server.variants : null;
+let VARIANTS = cfg.server.variants && Object.keys(cfg.server.variants).length ? cfg.server.variants : null;
 function variant() {
   if (!VARIANTS) return null;
   if (me.variant && VARIANTS[me.variant]) return { key: me.variant, ...VARIANTS[me.variant] };
@@ -316,19 +321,42 @@ const variantWorld = (v) => v?.world ?? v?.levelName ?? null;
 // else the level-name of the project's server.properties, else the only world in <root>\worlds.
 // { name, src }: name is the level-name the test server gets. Null when there is none.
 const isWorld = (d) => existsSync(join(d, 'level.dat')) || existsSync(join(d, 'db'));
-function worldSource() {
+function worldIn(root) {
   const w = variantWorld(variant()) ?? cfg.world;
   if (w) {
-    const p = resolve(SOURCE_DIR, expandEnv(w));
+    const p = resolve(root, expandEnv(w));
     if (isWorld(p)) return { name: basename(p), src: p };
-    return { name: w, src: join(SOURCE_DIR, 'worlds', w) };
+    return { name: w, src: join(root, 'worlds', w) };
   }
-  if (existsSync(join(SOURCE_DIR, 'server.properties'))) { const n = levelName(SOURCE_DIR); return { name: n, src: join(SOURCE_DIR, 'worlds', n) }; }
+  if (existsSync(join(root, 'server.properties'))) { const n = levelName(root); return { name: n, src: join(root, 'worlds', n) }; }
   let found = [];
-  try { found = readdirSync(join(SOURCE_DIR, 'worlds')).filter((d) => isWorld(join(SOURCE_DIR, 'worlds', d))); } catch {}
-  return found.length === 1 ? { name: found[0], src: join(SOURCE_DIR, 'worlds', found[0]) } : null;
+  try { found = readdirSync(join(root, 'worlds')).filter((d) => isWorld(join(root, 'worlds', d))); } catch {}
+  return found.length === 1 ? { name: found[0], src: join(root, 'worlds', found[0]) } : null;
 }
-const NO_WORLD_MSG = `no world to test in: put one world folder in ${join(SOURCE_DIR, 'worlds')}, or set "world" in bedmcp.json (a world folder, relative to the project). bedmcp copies it for every test server and never changes the original.`;
+// A git worktree usually has no worlds/ (gitignored): then the main worktree's world is copied
+// (read only, like any project world) and the result says so.
+function worldSource() {
+  const own = worldIn(SOURCE_DIR);
+  if (own && existsSync(own.src)) return own;
+  const main = mainWorktree(SOURCE_DIR);
+  const alt = main ? worldIn(main) : null;
+  if (alt && existsSync(alt.src)) return { ...alt, fromMainWorktree: main };
+  return own;
+}
+// The main working tree of the git worktree that holds dir, or null (not a linked worktree).
+function mainWorktree(dir) {
+  for (let d = resolve(dir); ; d = dirname(d)) {
+    const g = join(d, '.git');
+    if (existsSync(g)) {
+      try { if (statSync(g).isDirectory()) return null; } catch { return null; }
+      const m = (readFileSync(g, 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1] ?? '').trim().replace(/\//g, '\\');
+      const at = m.toLowerCase().lastIndexOf('\\.git\\worktrees\\');
+      return at > 0 ? m.slice(0, at) : null;
+    }
+    if (dirname(d) === d) return null;
+  }
+}
+const noWorldMsg = () => `no world to test in: put one world folder in ${join(SOURCE_DIR, 'worlds')}, or set "world" in bedmcp.json (a world folder, relative to the project). bedmcp copies it for every test server and never changes the original.`;
 // The server was set up for another variant than the one picked now (it needs a restart).
 function variantChanged(s) {
   const v = variant();
@@ -349,7 +377,7 @@ const variantNote = () => {
 // - Packs: any other repository. Its packs ("behaviorPacks" / "resourcePacks" in bedmcp.json, else
 //   every folder with a manifest.json up to 3 levels down) are linked one by one into the test
 //   server's development pack folders (junctions "bedmcp_<folder>") and turned on in its world copy.
-const BDS_LAYOUT = ['development_behavior_packs', 'development_resource_packs'].some((d) => existsSync(join(SOURCE_DIR, d)));
+let BDS_LAYOUT = ['development_behavior_packs', 'development_resource_packs'].some((d) => existsSync(join(SOURCE_DIR, d)));
 const SKIP_SCAN = new Set(['node_modules', '.git', 'worlds', 'dist', 'build', 'out', '.regolith', 'development_behavior_packs', 'development_resource_packs']);
 function packKind(dir) {
   const types = (readManifest(dir)?.modules ?? []).map((m) => m.type);
@@ -381,10 +409,37 @@ function packDirs(kind) {
 const linkTarget = (p) => { try { return lstatSync(p).isSymbolicLink() ? readlinkSync(p) : null; } catch { return null; } };
 // Every delete goes through safeRm (src/safefs.mjs): it unlinks links instead of entering them and
 // refuses any path inside the project or its packs (or one that holds them).
-try {
-  const devRoots = ['behavior', 'resource'].map((k) => join(SOURCE_DIR, `development_${k}_packs`));
-  protectPaths({ strict: [...packDirs('behavior'), ...packDirs('resource'), ...(BDS_LAYOUT ? devRoots : [])], project: [SOURCE_DIR], own: [STATE] });
-} catch (e) { log('protectPaths:', e.message); }
+// Additive: after a project switch the earlier project stays protected too.
+function guardProject() {
+  try {
+    const devRoots = ['behavior', 'resource'].map((k) => join(SOURCE_DIR, `development_${k}_packs`));
+    protectPaths({ strict: [...packDirs('behavior'), ...packDirs('resource'), ...(BDS_LAYOUT ? devRoots : [])], project: [SOURCE_DIR], own: [STATE] });
+  } catch (e) { log('protectPaths:', e.message); }
+}
+guardProject();
+
+// Points this session at another project folder (a git worktree, another add-on) without restarting
+// the MCP: the MCP reads its project folder once at start, and a session that changes folder
+// later would otherwise keep building and testing the old one. Machine settings never change.
+function applyProject(dir) {
+  const d = resolve(expandEnv(dir));
+  if (!existsSync(d)) throw new Error(`project folder ${d} does not exist`);
+  if (samePath(d, PROJECT_DIR)) return null;
+  const prev = PROJECT_DIR;
+  PROJECT_DIR = d;
+  let next;
+  try { next = loadConfig(); } catch (e) { PROJECT_DIR = prev; loadConfig(); throw new Error(`project ${d}: ${e.message}`); }
+  cfg = { ...cfg, server: { ...cfg.server, sourceDir: next.server.sourceDir, variants: next.server.variants }, build: next.build, resourcePacks: next.resourcePacks, behaviorPacks: next.behaviorPacks, world: next.world, serverProperties: next.serverProperties };
+  CONFIG_ERROR = null;
+  SOURCE_DIR = resolve(expandEnv(cfg.server.sourceDir ?? PROJECT_DIR));
+  VARIANTS = cfg.server.variants && Object.keys(cfg.server.variants).length ? cfg.server.variants : null;
+  BDS_LAYOUT = ['development_behavior_packs', 'development_resource_packs'].some((x) => existsSync(join(SOURCE_DIR, x)));
+  scanned = null;
+  guardProject();
+  if (me.variant && !VARIANTS?.[me.variant]) me.variant = null;
+  me.project = SOURCE_DIR; PROJECT_SET = true; saveMe();
+  return `project switched to ${SOURCE_DIR} (config: ${CONFIG_SOURCES.at(-1) ?? 'found by looking'})`;
+}
 const removeSafely = safeRm;
 // Junctions the project's packs into a server, so every build is live there.
 function linkDevPacks(dir) {
@@ -549,7 +604,7 @@ function syncLevel(s, { replace = false, fresh = false, userUp = [] } = {}) {
   // none, and on world_import. The replaced copy is backed up first.
   if (!ws || !existsSync(ws.src)) {
     if (ws && existsSync(join(s.dir, 'worlds', ws.name))) { notes.push(`the project has no world ${ws.src}: kept this server's copy`); return notes.join('; '); }
-    throw new Error(ws ? `the world ${ws.src} does not exist. ${NO_WORLD_MSG}` : NO_WORLD_MSG);
+    throw new Error(ws ? `the world ${ws.src} does not exist. ${noWorldMsg()}` : noWorldMsg());
   }
   const { name, src } = ws;
   const dst = join(s.dir, 'worlds', name);
@@ -699,7 +754,8 @@ async function runBuild() {
       out.push(`$ ${step.cmd} ${(step.args ?? []).join(' ')}  (in ${cwd}) -> exit ${r.code}\n${(r.stdout + r.stderr).trim().split('\n').slice(-30).join('\n')}`);
       if (r.code !== 0) throw new Error(`build failed:\n${out.join('\n\n')}`);
     }
-    return out.join('\n\n') || '(no build steps configured)';
+    const shared = sharingSessions();
+    return [`project ${SOURCE_DIR}`, shared.length ? `note: other live sessions use this project's packs and got this build too: ${shared.map((x) => x.name).join(', ')}` : null, out.join('\n\n') || '(no build steps configured)'].filter(Boolean).join('\n');
   });
 }
 
@@ -1053,10 +1109,44 @@ const mcp = new McpServer({ name: 'bedmcp', version: '0.3.0' }, {
   instructions: 'bedmcp opens a real Minecraft client and test server. Starting them (dev_cycle, game_launch, server_start) costs 1-2 minutes, so use these tools ONLY when the user asked for an in-game test or look, or when a question truly cannot be answered from the code, JSON, logs or files. After an ordinary code change, do not open the game on your own: say it was not tested in game and offer to test it. Tools on a session that is already running (screenshot, ui_read, server_command ...) are cheap. Multiplayer with one client: the bot tool adds simulated players (GameTest) to the test server of this session.'
     + (VARIANTS ? ` This project has variants, each a different game with its own world and settings: ${Object.entries(VARIANTS).map(([k, v]) => `"${k}" = ${v.hint ?? v.label ?? variantWorld(v)}`).join('; ')}. Pass variant (dev_cycle, server_start) for the one your work is about; it stays for the session. If the task does not say which, judge by the code you are changing, and ask the user when it is shared code.` : ''),
 });
-const reg = (name, description, shape, fn) => mcp.tool(name, description, shape, async (args) => {
+// The folders the Claude client says this session works in (MCP roots), when the client shares
+// them; [] otherwise. Only used to warn: a switch of project is always explicit (project param).
+let rootsCache = null;
+async function clientRoots() {
+  if (rootsCache) return rootsCache;
+  try {
+    if (!mcp.server.getClientCapabilities()?.roots) return [];
+    const r = await mcp.server.listRoots(undefined, { timeout: 3000 });
+    rootsCache = (r.roots ?? []).map((x) => x.uri).filter((u) => u.startsWith('file:')).map((u) => fileURLToPath(u));
+    return rootsCache;
+  } catch { return []; }
+}
+mcp.server.setNotificationHandler(RootsListChangedNotificationSchema, async () => { rootsCache = null; });
+
+// Tools that read the project take an optional `project` folder: it switches this session to it
+// (kept for the session). The switch stops this session's server, which served the old project.
+const PROJECT_TOOLS = new Set(['setup_check', 'server_sessions', 'build_packs', 'dev_cycle', 'server_start', 'server_restart', 'world_import', 'pack_sync']);
+const projectArg = { project: z.string().optional().describe('the project folder to build and test, kept for the session. Pass it when this session works in another folder than the one bedmcp started in (a git worktree, another add-on): bedmcp reads its folder once at start. Switching stops this session\'s server.') };
+async function useProject(p) {
+  const note = applyProject(p);
+  if (!note) return null;
+  if (!(await runningServer().catch(() => null))) return note;
+  try { await leave(); } catch {}
+  await serverStop();
+  return `${note}; this session's server was stopped (it served the previous project)`;
+}
+// Other live sessions on the same project folder: they share its packs, so a build here changes theirs.
+const sharingSessions = () => sessions().filter((x) => x.pid !== ME && x.project && samePath(x.project, SOURCE_DIR));
+const reg = (name, description, shape, fn) => mcp.tool(name, description, PROJECT_TOOLS.has(name) ? { ...shape, ...projectArg } : shape, async (args) => {
   Object.assign(me, { lastSeen: Date.now(), lastTool: name }); saveMe();
+  let switched = null;
+  if (args?.project) { try { switched = await useProject(args.project); } catch (e) { return fail(e); } }
   if (CONFIG_ERROR && name !== 'setup_check') return fail(`bedmcp config error: ${CONFIG_ERROR}. Fix it, then reconnect the MCP (setup_check shows what bedmcp sees).`);
-  try { return await fn(args ?? {}); } catch (e) { return fail(e); }
+  try {
+    const r = await fn(args ?? {});
+    if (switched && r?.content) r.content.unshift({ type: 'text', text: switched });
+    return r;
+  } catch (e) { return fail(e); }
 });
 const num = z.number();
 // Only in a project with variants (config server.variants): which one this session tests.
@@ -1095,9 +1185,15 @@ async function setupCheck() {
   }
   const tpl = existsSync(join(TEMPLATE_DIR, 'server.properties'));
   add(true, 'test server', tpl ? `${BASE_NAME} at ${TEMPLATE_DIR} (slot ${BASE_SLOT}, port ${BASE_PORT})` : `${BASE_NAME} not made yet: the first server_start or dev_cycle runs "BeDD.exe server init ${BASE_NAME}" (downloads BDS + LeviLamina, several minutes)`);
+  const main = mainWorktree(SOURCE_DIR);
+  add(true, 'project folder', `${SOURCE_DIR} (${PROJECT_SET ? 'set with the project param' : `from ${PROJECT_DIR_FROM}, read once when bedmcp started`})${main ? `; a git worktree of ${main}: its own packs and builds, separate from the main folder's` : ''}. Working in another folder now (a worktree, a moved session)? Pass project:"<folder>" to dev_cycle / build_packs / setup_check.`);
+  const roots = await clientRoots();
+  if (roots.length && !roots.some((r) => inside(r, SOURCE_DIR) || inside(SOURCE_DIR, r))) add(false, 'session folder', `the session works in ${roots.join(', ')}, but bedmcp tests ${SOURCE_DIR}`, `pass project:"${roots[0]}" (or the folder you mean) to switch`);
+  const sharing = sharingSessions();
+  if (sharing.length) add(true, 'shared packs', `other live sessions use this same project folder, so a build here changes their packs too: ${sharing.map(describe).join('; ')}. To test a branch without touching theirs, use a git worktree and pass project:"<worktree>"`);
   const ws = worldSource();
   const worldOk = !!ws && existsSync(ws.src);
-  add(worldOk, 'project world', ws ? `${ws.src}${worldOk ? '' : ' (missing)'}` : 'none found', NO_WORLD_MSG);
+  add(worldOk, 'project world', ws ? `${ws.src}${worldOk ? '' : ' (missing)'}${ws.fromMainWorktree ? ' (this worktree has no world: the main worktree\'s is copied)' : ''}` : 'none found', noWorldMsg());
   const bp = packDirs('behavior'), rp = packDirs('resource');
   add(bp.length + rp.length > 0, 'project packs', `${BDS_LAYOUT ? 'BDS-style folder' : 'packs layout'}; behavior: ${bp.map((d) => basename(d)).join(', ') || '-'}; resource: ${rp.map((d) => basename(d)).join(', ') || '-'}`, 'put packs (folders with manifest.json) in the project, or list them in bedmcp.json ("behaviorPacks", "resourcePacks")');
   add(true, 'build steps', (cfg.build ?? []).map((b) => [b.cmd, ...(b.args ?? [])].join(' ')).join(' && ') || 'none (build_packs and dev_cycle only reload)');
@@ -1219,7 +1315,7 @@ reg('dev_cycle', 'The test loop in one call on this session\'s own client and se
   };
   try {
     const s = await srv();
-    stamp(`slot ${s.slot}, server ${s.name} (port ${s.port})${variant() ? `, variant ${variantNote()}` : ''}`);
+    stamp(`project ${SOURCE_DIR}, slot ${s.slot}, server ${s.name} (port ${s.port})${variant() ? `, variant ${variantNote()}` : ''}`);
     if (build) { await runBuild(); stamp('built'); }
     const wasUp = !!(await runningServer());
     // Another variant than the server was set up for: its world, variables and properties change.

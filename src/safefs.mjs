@@ -16,11 +16,11 @@ let strict = [];  // never touched: not the folder, nothing in it, nothing that 
 let project = []; // same, except bedmcp's own state and temp folders when they sit inside it
 let ownDirs = [tmpdir()].map(norm);
 
-/** strict: the project's pack folders. project: the project folder. own: bedmcp's state folders. */
+/** Adds folders to protect (never replaces: a session that switched project keeps the old one safe). strict: the project's pack folders. project: the project folder. own: bedmcp's state folders. */
 export function protectPaths({ strict: s = [], project: p = [], own = [] } = {}) {
   const both = (x) => [norm(x), real(x)].filter(Boolean);
-  strict = [...new Set(s.flatMap(both))];
-  project = [...new Set(p.flatMap(both))];
+  strict = [...new Set([...strict, ...s.flatMap(both)])];
+  project = [...new Set([...project, ...p.flatMap(both)])];
   ownDirs = [...new Set([...ownDirs, ...own.flatMap(both)])];
 }
 

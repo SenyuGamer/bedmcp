@@ -83,7 +83,14 @@ Only one real client per session can join a server (all clients share one Micros
 
 ## Several sessions
 
-Each Claude session has its own client and server (up to `maxClients`, default 3). The packs are shared: `build_packs` in one session changes the code every session runs. `server_sessions {name, activity}` shows your slot and the other sessions.
+Each Claude session has its own client and server (up to `maxClients`, default 3). The packs are shared: `build_packs` in one session changes the code every session runs on the same project folder. `server_sessions {name, activity}` shows your slot, your project and the other sessions; `setup_check` warns when another live session uses the same folder.
+
+## Other folders and git worktrees
+
+bedmcp reads its project folder once, when it starts (the folder the chat was opened in). If this session now works somewhere else (it changed folder, or works in a git worktree), pass `project:"<folder>"` to `setup_check`, `dev_cycle`, `build_packs` or `server_start`: it switches this session to that folder for the rest of the session (and stops this session's server, which served the old one). Every `dev_cycle` and `build_packs` result starts with the project it used: check it.
+- To test a branch without touching another session's packs, use a git worktree: it has its own folder, so its own build output (`dist/` ...), and bedmcp treats it as its own project.
+- A worktree usually has no `worlds/` (gitignored): bedmcp then copies the main worktree's world, read only, and `setup_check` says so. Copy a world into the worktree if the branch needs a different one.
+- A project with other variants than the one bedmcp started in: restart the chat in that folder (the variant list is fixed at start).
 
 ## When done
 

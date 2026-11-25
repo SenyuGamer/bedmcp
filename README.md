@@ -96,6 +96,14 @@ Claude passes `variant` on its first `dev_cycle`; only that session's test serve
 (`properties` go to its `server.properties`, `config` JSON is merged over the project's `config/`,
 `resourcePacks` are linked into the client and put on top of that world copy's resource pack stack).
 
+**Other folders and git worktrees.** bedmcp reads the project folder once, when the chat starts.
+A session that moves to another folder (or works in a git worktree) passes `project:"<folder>"`
+to `setup_check`, `dev_cycle`, `build_packs` or `server_start`; it stays for the session. A
+worktree is its own project, with its own build output, so a branch can be tested without
+touching the packs another session uses. When the worktree has no `worlds/` (gitignored), the
+main worktree's world is copied. `setup_check` warns when another live session uses the same
+project folder, and when the client reports that the session works in a different folder.
+
 ## Machine settings
 
 Optional, in `%USERPROFILE%\.bedmcp\config.json` (`BEDMCP_HOME` moves the folder; `BEDMCP_CONFIG`
