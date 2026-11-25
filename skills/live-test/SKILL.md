@@ -57,6 +57,14 @@ To test something that happens over several actions (walk somewhere, hit a mob, 
 - `walk_to` is a straight line (no path finding): if it reports `arrived:false`, split the way into points. A form that opens stops it unless `closeScreens`.
 - Use `world_events {action:"start", track:[...]}` / `read {since, filter:"hurt|die"}` for things you do with other tools, and `profiler {action:"start"}` ... `{action:"stop"}` to find the scripts' hot spots.
 
+## Debugging the scripts
+
+When a bug's cause is not clear from logs and the journal, use the script debugger instead of adding console.log and rebuilding:
+- `debug {action:"attach"}`, then `debug {action:"break", file:"<path to the .ts>", lines:[N]}` (TypeScript works when the build writes a source map), then make the code run (`sequence`, `bot`, `server_command`) and `debug {action:"wait"}`: you get the stack in .ts files and the local/closure variables.
+- `debug {action:"eval", expression:"...", frameId:0}` evaluates in the stopped frame; `vars {ref}` expands objects; `next` / `step_in` / `step_out` / `continue`.
+- A stop freezes the whole server: continue quickly (bedmcp continues by itself after `holdSec`, default 60). Clear breakpoints on hot code (`break {file, clear:true}`) before continuing, or it stops again on the next tick. `detach` when done.
+- `debug {action:"stats"}` gives live engine numbers (memory, handle counts, subscribers per pack).
+
 ## Video (only when the user asks)
 
 Record a video ONLY when the user asks for one (a video, a recording, a clip, "show me it moving"); screenshots are enough otherwise.

@@ -87,12 +87,14 @@ server by hand, bedmcp sees it and never copies or touches the world while it ru
   "lobby": { "label": "Lobby", "hint": "lobby map, code in src/lobby", "world": "worlds/Lobby" },
   "arena": { "label": "Arena", "world": "worlds/Arena",
              "properties": { "view-distance": "8" },
-             "config": { "default/variables.json": { "mode": "ARENA" } } }
+             "config": { "default/variables.json": { "mode": "ARENA" } },
+             "resourcePacks": ["packs/ArenaRP"] }
 }
 ```
 
 Claude passes `variant` on its first `dev_cycle`; only that session's test server is set up for it
-(`properties` go to its `server.properties`, `config` JSON is merged over the project's `config/`).
+(`properties` go to its `server.properties`, `config` JSON is merged over the project's `config/`,
+`resourcePacks` are linked into the client and put on top of that world copy's resource pack stack).
 
 ## Machine settings
 
@@ -118,6 +120,7 @@ points to one file instead):
 - Loop: `dev_cycle` (build, reload, leave, rejoin, screenshot)
 - Scenarios: `sequence` (many steps in one call), `walk_to` (walk like a player, no teleport)
 - World as data: `world_events` (journal of spawns, damage, deaths, items, positions, TPS), `profiler` (script CPU profile)
+- Code: `debug` (script debugger: breakpoints in TypeScript, stack, variables, eval, live engine stats)
 - Server: `server_start`, `server_stop`, `server_restart`, `server_command`, `server_logs`, `build_packs`, `world_import`
 - Client: `game_launch`, `game_stop`, `game_status`, `game_join`, `game_leave`, `session_stop`, `pack_sync`
 - See: `screenshot`, `record` (MP4/GIF video), `ui_read`, `wait_for_screen`, `player_state`, `entities`
@@ -191,6 +194,26 @@ the run, the server's errors, and the video. `world_events` uses the same journa
 
 `profiler` runs BDS's script profiler (`script profiler start|stop`) and lists the functions that took
 the most CPU time (the runtime's own scheduler is marked idle).
+
+### Script debugger
+
+`debug` speaks the protocol of Mojang's "Minecraft Bedrock Debugger" for VS Code. bedmcp listens on
+loopback and the test server connects to it (`script debugger connect`; bedmcp's server.properties
+turns on `allow-outbound-script-debugging`). The server's own `listen` mode accepts a socket on this
+BDS but never answers it, so it stays off.
+
+```
+debug {action:"attach"}                                   # the project's pack with a source map
+debug {action:"break", file:"src/foo.ts", lines:[120]}     # TypeScript, mapped through the .js.map
+debug {action:"wait", timeoutSec:30}                      # stack (in .ts) + the top frame's variables
+debug {action:"eval", expression:"player.name", frameId:0}
+debug {action:"continue"}  /  next / step_in / step_out
+debug {action:"stats"}     /  logs / detach
+```
+
+A stopped script holds the whole server tick, so bedmcp continues by itself after `holdSec`
+(default 60). The debugger works on one pack per session: a breakpoint in another pack re-attaches
+to that pack.
 
 ### Video
 

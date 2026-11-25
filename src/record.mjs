@@ -4,7 +4,8 @@
 // between frames. Recording runs in the background, so other tools (move, ui_click,
 // bot ...) can act while it records.
 import { execFile } from 'node:child_process';
-import { mkdirSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { safeRm } from './safefs.mjs';
 import { join } from 'node:path';
 
 const run = (cmd, args, timeout) => new Promise((res) => {
@@ -70,7 +71,7 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
       const seconds = (r.ended - r.started) / 1000;
       return { file, format: r.format, seconds: Math.round(seconds * 10) / 10, frames: r.frames.length, capturedFps: Math.round((r.frames.length / Math.max(seconds, 0.1)) * 10) / 10, sizeMB: Math.round((statSync(file).size / 1048576) * 100) / 100, missedFrames: r.errors };
     } finally {
-      if (!r.keepFrames) rmSync(r.dir, { recursive: true, force: true });
+      if (!r.keepFrames) safeRm(r.dir);
       if (rec === r) rec = null;
     }
   }

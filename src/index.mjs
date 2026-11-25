@@ -12,13 +12,15 @@
 // stdout is the MCP channel: never print to it. Diagnostics go to stderr.
 
 import { execFile } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync, cpSync, mkdirSync, renameSync, statSync, symlinkSync, lstatSync, readlinkSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, cpSync, mkdirSync, renameSync, statSync, symlinkSync, lstatSync, readlinkSync, unlinkSync } from 'node:fs';
+import { safeRm, protectPaths } from './safefs.mjs';
 import { join, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { createRecorder } from './record.mjs';
+import { createDebugger } from './debugger.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const expandEnv = (s) => (typeof s === 'string' ? s.replace(/%([^%]+)%/g, (_, k) => process.env[k] ?? `%${k}%`) : s);
@@ -162,7 +164,7 @@ function writeJson(f, o) {
   const tmp = `${f}.${ME}.tmp`;
   writeFileSync(tmp, JSON.stringify(o, null, 1));
   for (let i = 0; i < 5; i++) { try { renameSync(tmp, f); return; } catch { /* a reader holds it */ } }
-  writeFileSync(f, JSON.stringify(o, null, 1)); rmSync(tmp, { force: true });
+  writeFileSync(f, JSON.stringify(o, null, 1)); safeRm(tmp);
 }
 const ago = (t) => `${Math.round((Date.now() - t) / 60000)} min ago`;
 
@@ -190,7 +192,7 @@ function sessions() {
     const s = readJson(join(STATE, 'sessions', f));
     if (!s) continue;
     if (s.pid === ME) { out.push(me); continue; }
-    if (!alive(s.pid)) { rmSync(join(STATE, 'sessions', f), { force: true }); continue; }
+    if (!alive(s.pid)) { safeRm(join(STATE, 'sessions', f)); continue; }
     out.push(s);
   }
   return out;
@@ -207,13 +209,13 @@ async function withLock(name, fn, waitMs = 600000) {
       let owner = 0, age = 0;
       try { owner = Number(readFileSync(join(dir, 'owner'), 'utf8')) || 0; } catch {}
       try { age = Date.now() - statSync(dir).mtimeMs; } catch { continue; } // released meanwhile
-      if (owner && !alive(owner)) { rmSync(dir, { recursive: true, force: true }); continue; }
-      if (!owner && age > 10000) { rmSync(dir, { recursive: true, force: true }); continue; }
+      if (owner && !alive(owner)) { safeRm(dir); continue; }
+      if (!owner && age > 10000) { safeRm(dir); continue; }
       if (Date.now() > end) throw new Error(`timed out waiting for the ${name} lock (held by pid ${owner})`);
       await sleep(500);
     }
   }
-  try { return await fn(); } finally { rmSync(dir, { recursive: true, force: true }); }
+  try { return await fn(); } finally { safeRm(dir); }
 }
 
 const slotOf = (instance) => Number(String(instance ?? '').match(/-(\d+)$/)?.[1] ?? 0);
@@ -238,7 +240,7 @@ async function mySlot() {
       const owner = Number(String(g.label ?? '').match(/^bedmcp:(\d+)$/)?.[1] ?? 0);
       if (!owner || (owner !== ME && nodePids.has(owner))) continue; // someone else's game (or an older bedmcp)
     }
-    if (holder) rmSync(f, { force: true });
+    if (holder) safeRm(f);
     try { writeFileSync(f, JSON.stringify({ pid: ME, name: me.name, at: Date.now() }), { flag: 'wx' }); } catch { continue; }
     Object.assign(me, { slot: n, server: serverNameOf(n) }); saveMe();
     return n;
@@ -377,14 +379,13 @@ function packDirs(kind) {
 }
 
 const linkTarget = (p) => { try { return lstatSync(p).isSymbolicLink() ? readlinkSync(p) : null; } catch { return null; } };
-// Removes a folder that may hold junctions to the project: the junctions are unlinked first, so a
-// recursive delete can never reach the project's files.
-function removeSafely(dir) {
-  if (linkTarget(dir)) { unlinkSync(dir); return; }
-  if (!existsSync(dir)) return;
-  for (const e of readdirSync(dir)) { const p = join(dir, e); if (linkTarget(p)) unlinkSync(p); }
-  rmSync(dir, { recursive: true, force: true });
-}
+// Every delete goes through safeRm (src/safefs.mjs): it unlinks links instead of entering them and
+// refuses any path inside the project or its packs (or one that holds them).
+try {
+  const devRoots = ['behavior', 'resource'].map((k) => join(SOURCE_DIR, `development_${k}_packs`));
+  protectPaths({ strict: [...packDirs('behavior'), ...packDirs('resource'), ...(BDS_LAYOUT ? devRoots : [])], project: [SOURCE_DIR], own: [STATE] });
+} catch (e) { log('protectPaths:', e.message); }
+const removeSafely = safeRm;
 // Junctions the project's packs into a server, so every build is live there.
 function linkDevPacks(dir) {
   for (const kind of ['behavior', 'resource']) {
@@ -411,6 +412,30 @@ function linkDevPacks(dir) {
     }
   }
 }
+// A variant's own resource packs (server.variants.<v>.resourcePacks), layered on top of the
+// project's for that variant only: linked into the client and put first in the world copy's stack.
+const variantPackDirs = (v = variant()) => (v?.resourcePacks ?? []).map((p) => resolve(SOURCE_DIR, expandEnv(p)));
+// Resource packs the client links: the variant's first, then the project's.
+const clientPackDirs = () => [...new Set([...variantPackDirs(), ...packDirs('resource')])];
+// The picked variant's packs go first in this server's world copy (never in the project's world).
+function enableVariantPacks(s) {
+  if (resolve(SOURCE_DIR).toLowerCase() === resolve(s.dir).toLowerCase()) return null;
+  const dirs = variantPackDirs();
+  if (!dirs.length) return null;
+  const f = join(s.dir, 'worlds', levelName(s.dir), 'world_resource_packs.json');
+  if (!existsSync(dirname(f))) return null;
+  let list = readJson(f) ?? [];
+  const on = [];
+  for (const d of [...dirs].reverse()) {
+    const h = readManifest(d)?.header;
+    if (!h?.uuid) { log(`variant pack ${d}: no manifest`); continue; }
+    list = [{ pack_id: h.uuid, version: h.version }, ...list.filter((p) => p.pack_id !== h.uuid)];
+    on.unshift(`${h.name ?? basename(d)} ${h.version.join('.')}`);
+  }
+  writeFileSync(f, JSON.stringify(list, null, 4));
+  return on.length ? `variant packs first in the world copy: ${on.join(', ')}` : null;
+}
+
 // Packs layout: the world copy lists the project's packs (uuid and current version), so they run.
 function enablePacks(s) {
   if (BDS_LAYOUT || resolve(SOURCE_DIR).toLowerCase() === resolve(s.dir).toLowerCase()) return null;
@@ -534,7 +559,7 @@ function syncLevel(s, { replace = false, fresh = false, userUp = [] } = {}) {
       if (existsSync(dst) && !replace) { notes.push(`the user's own server runs: kept this server's older copy of ${name}`); return notes.join('; '); }
       throw new Error(`${existsSync(dst) ? 'cannot import the world' : `this test server has no copy of the world ${name} yet, and cannot take one`}: ${USER_SERVER_MSG(userUp)}`);
     }
-    if (existsSync(dst)) { backupWorld(s); rmSync(dst, { recursive: true, force: true }); }
+    if (existsSync(dst)) { backupWorld(s); safeRm(dst); }
     cpSync(src, dst, { recursive: true });
     writeJson(join(s.dir, 'bedmcp-world.json'), { name, src, sig: worldSig(src), at: Date.now() });
     notes.push(`world ${name} copied fresh from ${src}`);
@@ -573,7 +598,7 @@ function backupWorld(s) {
   cpSync(src, dest, { recursive: true });
   const keep = cfg.server.keepBackups ?? 10;
   const old = readdirSync(root).filter((d) => d.startsWith(prefix)).sort();
-  for (const d of old.slice(0, Math.max(0, old.length - keep))) rmSync(join(root, d), { recursive: true, force: true });
+  for (const d of old.slice(0, Math.max(0, old.length - keep))) safeRm(join(root, d));
   return dest;
 }
 
@@ -600,7 +625,7 @@ async function serverStart({ timeoutMs = 180000 } = {}) {
     const corrupted = join(s.dir, 'worlds', levelName(s.dir), 'CORRUPTED.txt');
     if (existsSync(corrupted)) throw new Error(`the world is marked corrupted (${corrupted}): ${readFileSync(corrupted, 'utf8').trim()}. Restore it (bedmcp\\backups, or world_import from the project) before starting.`);
     const backup = /copied fresh/.test(synced ?? '') ? null : backupWorld(s);
-    const packsOn = enablePacks(s);
+    const packsOn = [enablePacks(s), enableVariantPacks(s)].filter(Boolean).join('; ') || null;
     try { installBotPack(s); } catch (e) { log('bot pack:', e.message); }
     const out = await bedd(['server', 'start', s.name, '--json', '--timeout', String(Math.round(timeoutMs / 1000))], timeoutMs + 30000);
     const info = jsonOut(out, '{', '}') ?? {};
@@ -621,7 +646,7 @@ function installBotPack(s) {
   if (cfg.bots === false || !BOT_UUID || resolve(SOURCE_DIR).toLowerCase() === resolve(s.dir).toLowerCase()) return null;
   const man = readJson(join(BOT_PACK, 'manifest.json'));
   const dst = join(s.dir, 'behavior_packs', 'bedmcp_bots');
-  rmSync(dst, { recursive: true, force: true });
+  safeRm(dst);
   cpSync(BOT_PACK, dst, { recursive: true });
   mkdirSync(join(s.dir, 'config', BOT_UUID), { recursive: true });
   writeJson(join(s.dir, 'config', BOT_UUID, 'permissions.json'), { allowed_modules: ['@minecraft/server', '@minecraft/server-gametest'] });
@@ -820,7 +845,18 @@ async function linkLocalPacks() {
   const users = (() => { try { return readdirSync(join(data, 'Users')).filter((d) => d !== 'Shared'); } catch { return []; } })();
   let changed = false;
   const report = [];
-  for (const src of packDirs('resource')) {
+  // Another variant's packs come off the global list (their links stay: unlisted, they do nothing).
+  const mine = new Set(clientPackDirs().map((d) => d.toLowerCase()));
+  const others = VARIANTS ? Object.values(VARIANTS).flatMap((v) => variantPackDirs(v)).filter((d) => !mine.has(d.toLowerCase())) : [];
+  const otherIds = new Set(others.map((d) => readManifest(d)?.header?.uuid).filter(Boolean));
+  if (otherIds.size) for (const u of users) {
+    const f = join(data, 'Users', u, 'games', 'com.mojang', 'minecraftpe', 'global_resource_packs.json');
+    let list = [];
+    try { list = JSON.parse(readFileSync(f, 'utf8')); } catch { continue; }
+    const kept = list.filter((p) => !otherIds.has(p.pack_id));
+    if (kept.length !== list.length) { writeFileSync(f, JSON.stringify(kept, null, 2)); changed = true; report.push(`another variant's packs off for user ${u}`); }
+  }
+  for (const src of clientPackDirs()) {
     const m = readManifest(src);
     if (!m) { report.push(`skip ${src}: no manifest.json`); continue; }
     mkdirSync(shared, { recursive: true });
@@ -851,11 +887,11 @@ async function linkLocalPacks() {
 async function syncPacks() {
   const cache = join(await clientDataDir(), 'minecraftpe', 'packcache');
   const report = [];
-  for (const dir of packDirs('resource')) {
+  for (const dir of clientPackDirs()) {
     const m = readManifest(dir);
     if (!m) continue;
     const found = findPacks(cache, m.header.uuid.toLowerCase());
-    for (const p of found) { if (lstatSync(p).isSymbolicLink()) continue; rmSync(p, { recursive: true, force: true }); report.push(`deleted ${p}`); }
+    for (const p of found) { if (lstatSync(p).isSymbolicLink()) continue; safeRm(p); report.push(`deleted ${p}`); }
   }
   return report.join('\n') || 'no downloaded copy cached';
 }
@@ -1681,6 +1717,67 @@ reg('sequence', 'Run several steps in a row on this session\'s client, in one ca
   return { content };
 });
 
+// --- script debugger (src/debugger.mjs): breakpoints, stack, variables, eval, live stats
+let dbg = null;
+function debuggerOf() {
+  if (dbg) return dbg;
+  const packs = packDirs('behavior').map((dir) => {
+    const m = readManifest(dir);
+    const script = (m?.modules ?? []).find((x) => x.type === 'script');
+    return { dir, name: m?.header?.name, entry: script?.entry, scriptUuid: script?.uuid };
+  });
+  dbg = createDebugger({ serverCommand: (c, o) => serverCommand(c, o), log, packs, projectDir: SOURCE_DIR });
+  return dbg;
+}
+let autoResume = null;
+const armAutoResume = (sec) => {
+  clearTimeout(autoResume);
+  if (sec > 0) autoResume = setTimeout(() => { if (dbg?.session?.stopped) dbg.resume().then(() => log(`debugger: auto-continued after ${sec} s`)).catch(() => {}); }, sec * 1000);
+};
+reg('debug', 'Script debugger on this session\'s test server (the protocol of the VS Code "Minecraft Bedrock Debugger"). attach (target: a pack name or script uuid; default the project\'s pack), then break {file, lines} with a TypeScript file (mapped through the built script\'s source map) or the built .js, then wait {timeoutSec} for a hit: returns the stack (in TS files) and the top frame\'s variables. Then vars {ref}, eval {expression, frameId}, continue / next / step_in / step_out / pause. logs (console output the debugger got), stats (memory, handles, scripting engine numbers, live), detach. A stopped script freezes the whole server tick: bedmcp continues by itself after holdSec (default 60). Combine with sequence or bot to make the code run.', {
+  action: z.enum(['attach', 'break', 'wait', 'state', 'vars', 'eval', 'continue', 'next', 'step_in', 'step_out', 'pause', 'logs', 'stats', 'detach']),
+  target: z.string().optional().describe('attach: which script pack (name part or module uuid)'),
+  file: z.string().optional().describe('break: e.g. "development_behavior_packs/BP/src/foo.ts" (relative to the project or the pack) or the built .js'),
+  lines: z.array(num).optional().describe('break: line numbers in that file'),
+  clear: z.boolean().optional().describe('break: replace this file\'s breakpoints (with no lines: remove them)'),
+  timeoutSec: num.optional().describe('wait: how long to wait for a hit (default 30)'),
+  holdSec: num.optional().describe('wait/step: continue by itself after this many seconds stopped (default 60, 0 = never)'),
+  ref: num.optional().describe('vars: a variablesReference from state'),
+  depth: num.optional().describe('vars/state: nested levels to expand (default 1)'),
+  expression: z.string().optional().describe('eval: a JS expression in the stopped frame'),
+  frameId: num.optional(),
+  filter: z.string().optional().describe('logs: regex'),
+}, async (a) => {
+  const d = debuggerOf();
+  const need = () => { if (!d.session?.sock) throw new Error('the debugger is not attached: debug {action:"attach"} first'); };
+  switch (a.action) {
+    case 'attach': return text(await d.attach({ target: a.target }));
+    case 'detach': clearTimeout(autoResume); return text(await d.detach());
+    case 'break': need(); if (!a.file) throw new Error('file is required'); return text(await d.setBreakpoints({ file: a.file, lines: a.lines ?? [], clear: a.clear }));
+    case 'wait': {
+      need();
+      const hit = await d.waitStop((a.timeoutSec ?? 30) * 1000);
+      if (!hit) return text({ stopped: false, note: 'no breakpoint was hit: make the code run (sequence, bot, command) and wait again' });
+      armAutoResume(a.holdSec ?? 60);
+      return text(await d.snapshot({ depth: a.depth ?? 1 }));
+    }
+    case 'state': need(); return text(await d.snapshot({ depth: a.depth ?? 1 }));
+    case 'vars': need(); return text(await d.vars(a.ref, a.depth ?? 1));
+    case 'eval': need(); return text(await d.request('evaluate', { expression: a.expression, frameId: a.frameId, context: 'repl' }));
+    case 'continue': need(); clearTimeout(autoResume); return text(await d.resume('continue'));
+    case 'next': case 'step_in': case 'step_out': {
+      need();
+      await d.resume({ next: 'next', step_in: 'stepIn', step_out: 'stepOut' }[a.action]);
+      const hit = await d.waitStop(5000);
+      if (hit) armAutoResume(a.holdSec ?? 60);
+      return text(hit ? await d.snapshot({ depth: a.depth ?? 1 }) : { running: true });
+    }
+    case 'pause': need(); await d.request('pause', { threadId: 1 }).catch(() => {}); return text({ paused: await d.waitStop(3000) });
+    case 'logs': need(); return text(d.prints(0, a.filter).slice(-80).map((p) => p.message).join('\n') || '(no output)');
+    case 'stats': need(); return text(d.statsSummary());
+  }
+});
+
 reg('entities', 'List entities with position via the server ("querytarget"), around this session\'s player. selector example: @e[type=minecraft:zombie,r=30] or @e[family=mob]. Positions are relative to the player when r= is used.', { selector: z.string().optional(), player: z.string().optional() }, async ({ selector = '@e[r=32]', player }) => {
   return text(await serverCommand(`execute as ${await target(player)} at @s run querytarget ${selector}`, { waitMs: 2500 }));
 });
@@ -1700,9 +1797,9 @@ const shutdown = async () => {
       const g = (jsonOut(await bedd(['ps', '--json'], 20000)) ?? []).find((x) => x.kind === 'client' && slotOf(x.instance) === me.slot && x.label === LABEL);
       if (g) await bedd(['stop', g.instance], 30000).catch(() => {});
       await serverStop().catch((e) => log(e.message));
-      rmSync(join(STATE, 'slots', `${me.slot}.json`), { force: true });
+      safeRm(join(STATE, 'slots', `${me.slot}.json`));
     }
-    rmSync(sessionFile(ME), { force: true });
+    safeRm(sessionFile(ME));
   } catch (e) { log('shutdown:', e.message); }
   process.exit(0);
 };
