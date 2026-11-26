@@ -115,6 +115,7 @@ points to one file instead):
 | `beddHome` | `%USERPROFILE%\.bedd` (Be.D.D.'s data: clones, servers) |
 | `stateDir` | `%USERPROFILE%\.bedd\bedmcp` (sessions, locks, world backups) |
 | `maxClients` | `3` parallel sessions |
+| `language` | the game's own (e.g. `en_US`): the client's language, written to its options.txt before each launch; `game_launch {language}` sets it per session |
 | `slotIdleMinutes` | `60`: a session idle this long with no client running loses its slot to a session that needs one (chats left open in the background keep their MCP alive) |
 | `server` | `{ "name": "bedmcp", "port": 19140 }`; slot N uses `bedmcp-N` and port 19140 + 2(N-1) |
 | `hotMod` | `true` (BedmcpHot, below) |

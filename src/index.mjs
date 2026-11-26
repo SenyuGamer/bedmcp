@@ -47,7 +47,7 @@ let PROJECT_SET = false;
 const PROJECT_DIR_FROM = process.env.CLAUDE_PROJECT_DIR ? "CLAUDE_PROJECT_DIR" : "the working directory";
 const USER_DIR = expandEnv(process.env.BEDMCP_HOME || '%USERPROFILE%\\.bedmcp');
 const PROJECT_FILES = ['bedmcp.json', '.bedmcp.json'];
-const MACHINE_KEYS = ['bedd', 'beddHome', 'stateDir', 'slot', 'maxClients', 'slotIdleMinutes', 'exclusiveSignaling', 'worldMode', 'hotMod', 'bots'];
+const MACHINE_KEYS = ['bedd', 'beddHome', 'stateDir', 'slot', 'maxClients', 'slotIdleMinutes', 'exclusiveSignaling', 'worldMode', 'hotMod', 'bots', 'language'];
 const CONFIG_SOURCES = [];
 
 function findProjectFile(dir) {
@@ -1076,6 +1076,24 @@ async function hotReload(action = 'ping', timeoutMs = 20000) {
   throw new Error(`BedmcpHot did not answer "${action}" within ${timeoutMs} ms (is the game running with the mod loaded?)`);
 }
 
+// The game's language (options.txt game_language, e.g. en_US), read at start: set before a launch.
+// 1.26.60's settings have no language option. Returns true when a file changed.
+async function setClientLanguage(lang) {
+  const data = await clientDataDir();
+  let users = [];
+  try { users = readdirSync(join(data, 'Users')).filter((d) => d !== 'Shared'); } catch {}
+  let changed = false;
+  for (const u of users) {
+    const f = join(data, 'Users', u, 'games', 'com.mojang', 'minecraftpe', 'options.txt');
+    let txt;
+    try { txt = readFileSync(f, 'utf8'); } catch { continue; }
+    const line = `game_language:${lang}`;
+    const next = /^game_language:.*$/m.test(txt) ? txt.replace(/^game_language:.*$/m, line) : `${txt.replace(/\s*$/, '')}\n${line}\n`;
+    if (next !== txt) { writeFileSync(f, next); changed = true; }
+  }
+  return changed;
+}
+
 // ---------------------------------------------------------------- game flows
 
 async function launch() {
@@ -1085,6 +1103,8 @@ async function launch() {
   if (!name) { await bedd(['instance', 'clone', '--slot', String(slot)], 900000); name = await slotInstance(slot); }
   game.instance = name;
   if (name) { await linkLocalPacks().catch((e) => log('local packs:', e.message)); await syncPacks().catch(() => {}); await installHotMod().catch((e) => log('hot mod:', e.message)); }
+  const lang = me.language ?? cfg.language;
+  if (name && lang) await setClientLanguage(lang).catch((e) => log('language:', e.message));
   let configured = false;
   try { if (name) { await ensureWorldMode(name); configured = true; } } catch { /* the mod is installed by the first launch */ }
   let info = await start();
@@ -1094,6 +1114,7 @@ async function launch() {
     await linkLocalPacks().catch((e) => log('local packs:', e.message));
     await installHotMod().catch((e) => log('hot mod:', e.message));
     await ensureWorldMode(info.instance).catch(() => false);
+    if (lang) await setClientLanguage(lang).catch(() => {});
     await bedd(['stop', info.instance]).catch(() => {});
     info = await start();
   } else if (!configured && (await ensureWorldMode(info.instance).catch(() => false))) {
@@ -1102,6 +1123,11 @@ async function launch() {
   }
   if (game.ws) try { game.ws.close(); } catch {}
   Object.assign(game, { ws: null, pid: info.pid, instance: info.instance });
+  // A size set with window_size / record {size} comes back after a restart.
+  if (me.windowSize) {
+    const [w, h] = me.windowSize.split('x').map(Number);
+    try { info.window = await setWindowSize(info, w, h); } catch (e) { info.window = `not restored: ${e.message}`; }
+  }
   return info;
 }
 
@@ -1331,8 +1357,14 @@ reg('world_import', 'Replace this session\'s server world with the project\'s cu
 });
 
 // --- client lifecycle
-reg('game_launch', 'Start (or reuse) this session\'s background Minecraft client (Be.D.D., its own slot). The first time a slot is used it clones the base instance (~800 MB, a minute or two).', {}, async () => {
+reg('game_launch', 'Start (or reuse) this session\'s background Minecraft client (Be.D.D., its own slot). The first time a slot is used it clones the base instance (~800 MB, a minute or two).', {
+  language: z.string().regex(/^[a-z]{2}_[A-Z]{2}$/).optional().describe('the game\'s language, e.g. en_US or es_ES; kept for this session (later launches and dev_cycle use it). A running game with another language is restarted'),
+}, async ({ language }) => {
   const g = await findGame();
+  if (language && language !== me.language) {
+    me.language = language; saveMe();
+    if (g) { await stopClient(); const info = await launch(); await waitTitle(); return text({ restarted: `for language ${language}`, ...info, token: undefined }); }
+  }
   if (g) return text({ alreadyRunning: true, ...g, token: undefined });
   const info = await launch();
   await waitTitle();
@@ -1489,6 +1521,7 @@ reg('record', 'Record a video (MP4 or GIF) of this session\'s game, for the user
 async function setWindowSize(g, width, height) {
   if (width < 320 || height < 240 || width > 3840 || height > 2160) throw new Error('size: from 320x240 to 3840x2160');
   const got = await resizeGameWindow(g.pid, width, height);
+  me.windowSize = `${got.width}x${got.height}`; saveMe();
   await call('window', {}, 10000).catch(() => {}); // Be.D.D. lays it out again (off screen, at the back)
   await sleep(500); // the game resizes its swap chain on the next frames
   return `${got.width}x${got.height}`;
