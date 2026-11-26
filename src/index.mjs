@@ -922,12 +922,21 @@ async function selectSlot(slot) {
     return { slot, via: `number key (the slot op failed: ${e.message})` };
   }
 }
-// Be.D.D.'s button "click" can leave the button held (seen 2026-11-26 with "use": the held item then
-// fired by itself), so a click is sent as down, a short hold, then up.
-async function clickButton(button, holdTicks = 2) {
-  const down = await call('button', { button, action: 'down' });
-  try { await sleep(Math.max(1, holdTicks) * 50); } finally { await call('button', { button, action: 'up' }).catch(() => {}); }
-  return { button, clicked: true, holdTicks, tick: down.tick };
+// Attack and use go through a simulated mouse click at the crosshair: Be.D.D.'s button op holds the
+// button but does not hit or use entities (verified for attack 2026-11-24, for use on an entity
+// 2026-11-26: a right click opened its form, the button op did not), and its "click" can leave the
+// button held. Pick stays on the button op. holdTicks: press, hold, release.
+const MOUSE_OF = { attack: 'left', use: 'right' };
+async function pressButton(button, action) {
+  const m = MOUSE_OF[button];
+  if (!m) return call('button', { button, action });
+  return call('mouse', { action, button: m, rx: 0.5, ry: 0.5 });
+}
+async function clickButton(button, holdTicks) {
+  if (MOUSE_OF[button] && !holdTicks) { const r = await pressButton(button, 'click'); return { button, clicked: true, tick: r.tick }; }
+  const down = await pressButton(button, 'down');
+  try { await sleep(Math.max(1, holdTicks ?? 2) * 50); } finally { await pressButton(button, 'up').catch(() => {}); }
+  return { button, clicked: true, holdTicks: holdTicks ?? 2, tick: down.tick };
 }
 
 // ---------------------------------------------------------------- resource pack sync
@@ -1549,8 +1558,8 @@ reg('move', 'Walk with the client for a time: x = strafe (-1..1, +1 = left), z =
 // Be.D.D.'s slot op sometimes times out ("did not select the slot") although the number key works
 // (seen 2026-11-26 while recording): fall back to the key and check the selected slot.
 reg('hotbar', 'Select a hotbar slot 0..8.', { slot: num }, async ({ slot }) => text(await selectSlot(slot)));
-reg('mouse_button', 'Attack/use/pick on what the crosshair targets: click (press and release; holdTicks to hold longer, 20 ticks = 1 s), or down/up to hold.', { button: z.enum(['attack', 'use', 'pick']), action: z.enum(['click', 'down', 'up']).optional(), holdTicks: num.optional() }, async ({ button, action = 'click', holdTicks }) => {
-  if (action !== 'click') return text(await call('button', { button, action }));
+reg('mouse_button', 'Attack/use/pick on what the crosshair targets (attack and use are a mouse click at the crosshair, which hits and uses entities too): click (press and release; holdTicks to hold longer, 20 ticks = 1 s), or down/up to hold.', { button: z.enum(['attack', 'use', 'pick']), action: z.enum(['click', 'down', 'up']).optional(), holdTicks: num.optional() }, async ({ button, action = 'click', holdTicks }) => {
+  if (action !== 'click') return text(await pressButton(button, action));
   return text(await clickButton(button, holdTicks));
 });
 reg('game_action', 'drop | dropAll | inventory | perspective | pause | swing.', { name: z.enum(['drop', 'dropAll', 'inventory', 'perspective', 'pause', 'swing']) }, async (a) => text(await call('action', a)));
