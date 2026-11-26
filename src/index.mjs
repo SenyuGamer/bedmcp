@@ -46,7 +46,7 @@ let PROJECT_SET = false;
 const PROJECT_DIR_FROM = process.env.CLAUDE_PROJECT_DIR ? "CLAUDE_PROJECT_DIR" : "the working directory";
 const USER_DIR = expandEnv(process.env.BEDMCP_HOME || '%USERPROFILE%\\.bedmcp');
 const PROJECT_FILES = ['bedmcp.json', '.bedmcp.json'];
-const MACHINE_KEYS = ['bedd', 'beddHome', 'stateDir', 'slot', 'maxClients', 'exclusiveSignaling', 'worldMode', 'hotMod', 'bots'];
+const MACHINE_KEYS = ['bedd', 'beddHome', 'stateDir', 'slot', 'maxClients', 'slotIdleMinutes', 'exclusiveSignaling', 'worldMode', 'hotMod', 'bots'];
 const CONFIG_SOURCES = [];
 
 function findProjectFile(dir) {
@@ -229,28 +229,66 @@ const serverNameOf = (slot) => (slot === BASE_SLOT ? BASE_NAME : `${BASE_NAME}-$
 
 // Each session claims a slot: its own client clone and its own server. A slot is free when no live
 // session holds it and no game of another live session (or one bedmcp did not start) runs in it.
+// A chat left open in the background keeps its MCP (and so its slot) alive: a slot whose holder has
+// used no tool for slotIdleMinutes (default 60) and has no client running is taken over; its server,
+// if up, is stopped cleanly first (the "stop" command). The old holder gets another slot on its next call.
+const slotFile = (n) => join(STATE, 'slots', `${n}.json`);
+const IDLE_MS = (cfg.slotIdleMinutes ?? 60) * 60000;
+let slotNote = null; // told once to this session's next tool result
 async function mySlot() {
-  if (me.slot) return me.slot;
+  if (me.slot) {
+    const h = readJson(slotFile(me.slot));
+    if (!h || h.pid === ME) return me.slot;
+    // Another session took this slot over while this one was idle.
+    slotNote = `this session's slot ${me.slot} was taken over by ${h.name ?? h.pid} while this session was idle; it now uses another slot (its client and server start anew)`;
+    log(slotNote);
+    Object.assign(me, { slot: null, server: null, player: null }); serverCache = null; saveMe();
+  }
+  return withLock('slots', claimSlot, 240000); // a takeover may wait for a server to stop
+}
+async function claimSlot() {
   const max = cfg.maxClients ?? 3;
   let games = [];
   try { games = jsonOut(await bedd(['ps', '--json'], 30000)) ?? []; } catch {}
   // Windows reuses pids: a holder only counts while its pid is still a node process.
   const nodePids = new Set((await run('tasklist', ['/FI', 'IMAGENAME eq node.exe', '/FO', 'CSV', '/NH'])).stdout.split(/\r?\n/).map((l) => Number(l.split('","')[1])).filter(Boolean));
+  const claim = (n, holder) => {
+    const f = slotFile(n);
+    if (holder) safeRm(f);
+    try { writeFileSync(f, JSON.stringify({ pid: ME, name: me.name, at: Date.now() }), { flag: 'wx' }); } catch { return false; }
+    Object.assign(me, { slot: n, server: serverNameOf(n) }); serverCache = null; saveMe();
+    return true;
+  };
+  const idle = []; // slots of live but idle holders, without a client running
   for (let n = BASE_SLOT; n < BASE_SLOT + max; n++) {
-    const f = join(STATE, 'slots', `${n}.json`);
-    const holder = readJson(f);
-    if (holder && holder.pid !== ME && nodePids.has(holder.pid)) continue;
+    const holder = readJson(slotFile(n));
     const g = games.find((x) => x.kind === 'client' && slotOf(x.instance) === n);
     if (g) {
       const owner = Number(String(g.label ?? '').match(/^bedmcp:(\d+)$/)?.[1] ?? 0);
       if (!owner || (owner !== ME && nodePids.has(owner))) continue; // someone else's game (or an older bedmcp)
     }
-    if (holder) safeRm(f);
-    try { writeFileSync(f, JSON.stringify({ pid: ME, name: me.name, at: Date.now() }), { flag: 'wx' }); } catch { continue; }
-    Object.assign(me, { slot: n, server: serverNameOf(n) }); saveMe();
-    return n;
+    if (holder && holder.pid !== ME && nodePids.has(holder.pid)) {
+      const last = readJson(sessionFile(holder.pid))?.lastSeen ?? holder.at ?? Date.now();
+      if (!g && Date.now() - last > IDLE_MS) idle.push({ n, holder, last });
+      continue;
+    }
+    if (claim(n, holder)) return n;
   }
-  throw new Error(`no free slot: slots ${BASE_SLOT}..${BASE_SLOT + max - 1} are used by other sessions or games (server_sessions lists them). Raise maxClients in config.json (each slot is a ~800 MB client clone plus a ~600 MB server copy) or end another session.`);
+  // Take over an idle slot: the one whose server is down first, then the longest idle.
+  for (const c of idle) c.up = !!(await serverInfo(serverNameOf(c.n)).catch(() => null))?.running;
+  idle.sort((a, b) => (a.up - b.up) || (a.last - b.last));
+  for (const c of idle) {
+    if (!claim(c.n, c.holder)) continue;
+    let stopped = '';
+    if (c.up) {
+      try { const r = await serverStop(); stopped = r.stopped ? `; its server ${r.server} was stopped cleanly` : ''; }
+      catch (e) { safeRm(slotFile(c.n)); Object.assign(me, { slot: null, server: null }); saveMe(); throw new Error(`slot ${c.n} (idle holder ${c.holder.name}) could not be taken over: ${e.message}`); }
+    }
+    slotNote = `took over slot ${c.n} from ${c.holder.name ?? c.holder.pid} (idle ${Math.round((Date.now() - c.last) / 60000)} min, no client running)${stopped}`;
+    log(slotNote);
+    return c.n;
+  }
+  throw new Error(`no free slot: slots ${BASE_SLOT}..${BASE_SLOT + max - 1} are used by other sessions or games (server_sessions lists them). A slot is taken over once its holder has been idle ${Math.round(IDLE_MS / 60000)} min with no client running (slotIdleMinutes in config.json). Raise maxClients (each slot is a ~800 MB client clone plus a ~600 MB server copy) or end another session.`);
 }
 
 // ---------------------------------------------------------------- this session's server
@@ -823,6 +861,7 @@ async function sideConnection() {
     if (w) { waiting.delete(r.id); w(r); }
   };
   return {
+    ws,
     call: (op, fields = {}, limit = 10000) => new Promise((res, rej) => {
       const id = next++;
       const timer = setTimeout(() => { waiting.delete(id); rej(new Error(`${op}: no reply in ${limit} ms`)); }, limit);
@@ -1145,6 +1184,7 @@ const reg = (name, description, shape, fn) => mcp.tool(name, description, PROJEC
   try {
     const r = await fn(args ?? {});
     if (switched && r?.content) r.content.unshift({ type: 'text', text: switched });
+    if (slotNote && r?.content) { r.content.unshift({ type: 'text', text: slotNote }); slotNote = null; }
     return r;
   } catch (e) { return fail(e); }
 });
@@ -1385,8 +1425,20 @@ reg('dev_cycle', 'The test loop in one call on this session\'s own client and se
 // --- seeing
 reg('screenshot', 'Screenshot of this session\'s game (works while the window is hidden). Returns an image.', { maxWidth: num.optional(), region: z.object({ x: num, y: num, w: num, h: num }).optional(), format: z.enum(['jpeg', 'png']).optional() }, async (a) => ({ content: [await screenshotContent(a)] }));
 // --- video: screenshots in a loop, encoded by ffmpeg (src/record.mjs)
-const recorder = createRecorder({ call, log, outDir: expandEnv(cfg.recordDir ?? join(STATE, 'recordings')), ffmpeg: expandEnv(cfg.ffmpeg ?? 'ffmpeg') });
-reg('record', 'Record a video (MP4 or GIF) of this session\'s game, for the user to watch. ONLY when the user asks for a video or recording; screenshots are enough otherwise. "clip" records `seconds` and returns the file; "start" records in the background while you act with other tools (move, ui_click, bot, dev_cycle ...), then "stop" returns the file; "status" tells what is recording. Frames are captured from the game itself, so it works with the window hidden and the monitor off: ~25-30 fps captured (about 20+ distinct fps while moving, measured), no sound. Needs ffmpeg. Give the returned file to the user (e.g. send it as a file).', {
+// The recorder grabs frames on its own connection: a request that waits on the main one (a key
+// hold, a walk, a join) must not stall the capture (seen: separate key calls during record start
+// dropped it from ~21 to ~4 fps). Reopened when it closes (the client restarted).
+let recConn = null;
+async function recordCall(op, fields, limit) {
+  if (!recConn || recConn.closed) {
+    try { recConn = await sideConnection(); } catch { return call(op, fields, limit); }
+    const c = recConn;
+    c.ws.addEventListener('close', () => { c.closed = true; });
+  }
+  try { return await recConn.call(op, fields, limit); } catch (e) { if (/no reply/.test(e.message)) { recConn.close(); recConn.closed = true; } throw e; }
+}
+const recorder = createRecorder({ call: recordCall, log, outDir: expandEnv(cfg.recordDir ?? join(STATE, 'recordings')), ffmpeg: expandEnv(cfg.ffmpeg ?? 'ffmpeg') });
+reg('record', 'Record a video (MP4 or GIF) of this session\'s game, for the user to watch. ONLY when the user asks for a video or recording; screenshots are enough otherwise. "clip" records `seconds` and returns the file; "start" records in the background while you act with other tools (move, ui_click, bot, dev_cycle ...), then "stop" returns the file; "status" tells what is recording. Frames are captured from the game itself, so it works with the window hidden and the monitor off (but not with the Windows session locked: then ~1-2 fps, and the result has a warning): ~25-30 fps captured (about 20+ distinct fps while moving, measured), no sound. Needs ffmpeg. Give the returned file to the user (e.g. send it as a file).', {
   action: z.enum(['clip', 'start', 'stop', 'status']),
   seconds: num.optional().describe('clip: length; start: the most it records before stopping by itself (default 60, max 600)'),
   fps: num.optional().describe('frames per second to capture (default 30, max 30)'),
@@ -1889,7 +1941,7 @@ let exiting = false;
 const shutdown = async () => {
   if (exiting) return; exiting = true;
   try {
-    if (me.slot) {
+    if (me.slot && readJson(slotFile(me.slot))?.pid === ME) { // not if another session took it over
       const g = (jsonOut(await bedd(['ps', '--json'], 20000)) ?? []).find((x) => x.kind === 'client' && slotOf(x.instance) === me.slot && x.label === LABEL);
       if (g) await bedd(['stop', g.instance], 30000).catch(() => {});
       await serverStop().catch((e) => log(e.message));

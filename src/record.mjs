@@ -1,5 +1,5 @@
 // Video recording of the game: bedmcp grabs the client's frames in a loop through Be.D.D.'s screenshot
-// op (captured inside the game, so it works with the window hidden and the monitor off; ~28 fps
+// op (captured inside the game, so it works with the window hidden and the monitor off, not with the session locked; ~28 fps
 // measured at 1024 px), and ffmpeg encodes them into an MP4 or a GIF, keeping the real time
 // between frames. Recording runs in the background, so other tools (move, ui_click,
 // bot ...) can act while it records.
@@ -11,6 +11,17 @@ import { join } from 'node:path';
 const run = (cmd, args, timeout) => new Promise((res) => {
   execFile(cmd, args, { windowsHide: true, maxBuffer: 16 << 20, timeout }, (err, stdout, stderr) => res({ code: err ? (err.code ?? 1) : 0, out: `${stdout}${stderr}` }));
 });
+
+// Windows throttles the game's rendering to ~1-2 fps while the session is locked (lock screen,
+// or a remote session that left the desktop locked); screenshots still work, so nothing else shows
+// it. LogonUI.exe runs only while the lock or sign-in screen is up (LockApp.exe stays, suspended).
+async function sessionLocked() {
+  if (process.platform !== 'win32') return false;
+  const r = await run('tasklist', ['/FI', 'IMAGENAME eq LogonUI.exe', '/NH'], 10000);
+  return /logonui\.exe/i.test(r.out);
+}
+const LOCKED_NOTE = 'the Windows session is locked: Windows throttles the game to ~1-2 fps, so the video will be choppy. Unlock the PC (keep it unlocked while recording; the monitor may be off)';
+const LOW_FPS = 10;
 
 export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
   let rec = null; // the recording in progress
@@ -69,7 +80,15 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
     try {
       const file = await encode(r);
       const seconds = (r.ended - r.started) / 1000;
-      return { file, format: r.format, seconds: Math.round(seconds * 10) / 10, frames: r.frames.length, capturedFps: Math.round((r.frames.length / Math.max(seconds, 0.1)) * 10) / 10, sizeMB: Math.round((statSync(file).size / 1048576) * 100) / 100, missedFrames: r.errors };
+      const capturedFps = Math.round((r.frames.length / Math.max(seconds, 0.1)) * 10) / 10;
+      const out = { file, format: r.format, seconds: Math.round(seconds * 10) / 10, frames: r.frames.length, capturedFps, sizeMB: Math.round((statSync(file).size / 1048576) * 100) / 100, missedFrames: r.errors };
+      if (capturedFps < Math.min(LOW_FPS, r.fps * 0.5)) {
+        const locked = r.lockedAtStart || (await sessionLocked());
+        out.warning = locked
+          ? `capturedFps ${capturedFps}: ${LOCKED_NOTE}`
+          : `capturedFps ${capturedFps} is low (the game rendered few frames): is the Windows session locked, the PC asleep, or the game minimized or throttled? Screenshots still work in those states.`;
+      }
+      return out;
     } finally {
       if (!r.keepFrames) safeRm(r.dir);
       if (rec === r) rec = null;
@@ -89,6 +108,7 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
     };
     r.dir = join(outDir, '.frames', r.name);
     mkdirSync(r.dir, { recursive: true });
+    r.lockedAtStart = await sessionLocked();
     r.done = loop(r);
     rec = r;
     return r;
@@ -98,7 +118,7 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
     // Starts a background recording; it ends by itself after `seconds` (max 600) or on stop().
     async start(opts) {
       const r = await start(opts);
-      return { recording: r.name, maxSeconds: Math.round((r.until - r.started) / 1000), fps: r.fps, note: 'recording in the background: act with the other tools, then record {action:"stop"} to get the file' };
+      return { recording: r.name, maxSeconds: Math.round((r.until - r.started) / 1000), fps: r.fps, note: 'recording in the background: act with the other tools, then record {action:"stop"} to get the file', ...(r.lockedAtStart ? { warning: LOCKED_NOTE } : {}) };
     },
     // Records `seconds` and waits for the file.
     async clip(opts) {

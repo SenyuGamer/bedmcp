@@ -115,6 +115,7 @@ points to one file instead):
 | `beddHome` | `%USERPROFILE%\.bedd` (Be.D.D.'s data: clones, servers) |
 | `stateDir` | `%USERPROFILE%\.bedd\bedmcp` (sessions, locks, world backups) |
 | `maxClients` | `3` parallel sessions |
+| `slotIdleMinutes` | `60`: a session idle this long with no client running loses its slot to a session that needs one (chats left open in the background keep their MCP alive) |
 | `server` | `{ "name": "bedmcp", "port": 19140 }`; slot N uses `bedmcp-N` and port 19140 + 2(N-1) |
 | `hotMod` | `true` (BedmcpHot, below) |
 | `bots` | `true` (the bot pack) |
@@ -228,6 +229,9 @@ to that pack.
 `record` captures the game's own frames through Be.D.D. (no screen capture), so it works with the
 window hidden and the monitor off: about 28 fps captured at 1024 px, encoded by ffmpeg to MP4 (H.264)
 or GIF, no sound. `clip` records N seconds; `start`/`stop` records while Claude acts with other tools.
+The Windows session must be unlocked: on a locked PC (lock screen, or a remote session that left it
+locked) Windows throttles the game to ~1-2 fps. Screenshots still work then, so `record` checks for
+the lock screen and warns, and warns on any capture under 10 fps.
 The skill tells Claude to record only when the user asks for a video.
 
 ## Limits

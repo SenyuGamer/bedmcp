@@ -69,8 +69,8 @@ When a bug's cause is not clear from logs and the journal, use the script debugg
 
 Record a video ONLY when the user asks for one (a video, a recording, a clip, "show me it moving"); screenshots are enough otherwise.
 - `record {action:"clip", seconds:10}`: records and returns an MP4.
-- `record {action:"start", seconds:60}`, then act (`move`, `ui_click`, `bot`, `dev_cycle` ...), then `record {action:"stop"}`: records what you do.
-- `format:"gif"` for a small looping clip. About 28 fps, no sound; works with the window hidden and the monitor off.
+- `record {action:"start", seconds:60}`, then act (`move`, `ui_click`, `bot`, `dev_cycle` ...), then `record {action:"stop"}`: records what you do. For a scripted run of inputs, prefer one `sequence {record:true, steps:[...]}`: no gaps between your tool calls in the video.
+- `format:"gif"` for a small looping clip. About 28 fps, no sound; works with the window hidden and the monitor off, but NOT with the Windows session locked (the game drops to ~1-2 fps). If the result has a `warning`, tell the user (e.g. ask them to unlock the PC) instead of sending a choppy video as if it were fine.
 - Give the file to the user (send it as a file when the chat can, else say its path).
 
 ## Second player: bots
@@ -83,7 +83,7 @@ Only one real client per session can join a server (all clients share one Micros
 
 ## Several sessions
 
-Each Claude session has its own client and server (up to `maxClients`, default 3). The packs are shared: `build_packs` in one session changes the code every session runs on the same project folder. `server_sessions {name, activity}` shows your slot, your project and the other sessions; `setup_check` warns when another live session uses the same folder.
+Each Claude session has its own client and server (up to `maxClients`, default 3). When all slots are taken, a slot whose session has been idle 60 min with no client running is taken over (its server is stopped cleanly); the result says so. The packs are shared: `build_packs` in one session changes the code every session runs on the same project folder. `server_sessions {name, activity}` shows your slot, your project and the other sessions; `setup_check` warns when another live session uses the same folder.
 
 ## Other folders and git worktrees
 
