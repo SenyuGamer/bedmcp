@@ -70,6 +70,7 @@ When a bug's cause is not clear from logs and the journal, use the script debugg
 Record a video ONLY when the user asks for one (a video, a recording, a clip, "show me it moving"); screenshots are enough otherwise.
 - `record {action:"clip", seconds:10}`: records and returns an MP4.
 - `record {action:"start", seconds:60}`, then act (`move`, `ui_click`, `bot`, `dev_cycle` ...), then `record {action:"stop"}`: records what you do. For a scripted run of inputs, prefer one `sequence {record:true, steps:[...]}`: no gaps between your tool calls in the video.
+- 16:9 video: `record {..., size:"1920x1080", maxWidth:1920}` (or `window_size` first); the default window is 1024x722.
 - `format:"gif"` for a small looping clip. About 28 fps, no sound; works with the window hidden and the monitor off, but NOT with the Windows session locked (the game drops to ~1-2 fps). If the result has a `warning`, tell the user (e.g. ask them to unlock the PC) instead of sending a choppy video as if it were fine.
 - Give the file to the user (send it as a file when the chat can, else say its path).
 

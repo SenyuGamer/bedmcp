@@ -232,6 +232,10 @@ or GIF, no sound. `clip` records N seconds; `start`/`stop` records while Claude 
 The Windows session must be unlocked: on a locked PC (lock screen, or a remote session that left it
 locked) Windows throttles the game to ~1-2 fps. Screenshots still work then, so `record` checks for
 the lock screen and warns, and warns on any capture under 10 fps.
+The game renders at its hidden window's size (1024x722 by default). For 16:9 videos, `window_size
+{width:1920, height:1080}` or `record {size:"1920x1080", maxWidth:1920}` resizes it first (the window
+loses its title bar so a 1080 p window fits a 1080 p screen). The capture rate is the game's own frame
+rate: heavy settings such as Vibrant Visuals at 1080 p give about 24 fps.
 The skill tells Claude to record only when the user asks for a video.
 
 ## Limits

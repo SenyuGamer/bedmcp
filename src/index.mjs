@@ -21,6 +21,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { RootsListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createRecorder } from './record.mjs';
+import { resizeGameWindow } from './window.mjs';
 import { createDebugger } from './debugger.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -910,6 +911,25 @@ async function screenshotContent(opts = {}) {
 
 async function worldState() { return call('world'); }
 
+// Be.D.D.'s slot op sometimes times out ("did not select the slot") although the number key works
+// (seen 2026-11-26 while recording): fall back to the key and check the selected slot.
+async function selectSlot(slot) {
+  try { return await call('slot', { slot }); } catch (e) {
+    await call('key', { key: String(slot + 1) });
+    await sleep(200);
+    const now = (await worldState())?.player?.slot;
+    if (now !== slot) throw new Error(`${e.message}; the number key ${slot + 1} did not select it either (selected: ${now ?? '?'})`);
+    return { slot, via: `number key (the slot op failed: ${e.message})` };
+  }
+}
+// Be.D.D.'s button "click" can leave the button held (seen 2026-11-26 with "use": the held item then
+// fired by itself), so a click is sent as down, a short hold, then up.
+async function clickButton(button, holdTicks = 2) {
+  const down = await call('button', { button, action: 'down' });
+  try { await sleep(Math.max(1, holdTicks) * 50); } finally { await call('button', { button, action: 'up' }).catch(() => {}); }
+  return { button, clicked: true, holdTicks, tick: down.tick };
+}
+
 // ---------------------------------------------------------------- resource pack sync
 
 function readManifest(dir) {
@@ -1445,11 +1465,29 @@ reg('record', 'Record a video (MP4 or GIF) of this session\'s game, for the user
   format: z.enum(['mp4', 'gif']).optional().describe('mp4 (default) or gif (small, max 15 fps, 640 px wide)'),
   maxWidth: num.optional().describe('frame width in pixels (default 1280)'),
   name: z.string().optional().describe('a short name for the file, e.g. "shop-form"'),
+  size: z.string().regex(/^\d{3,4}x\d{3,4}$/).optional().describe('clip/start: set the game window to this size first, e.g. "1920x1080" or "1280x720" for 16:9 (it stays; see window_size). Pass maxWidth too (e.g. 1920) to keep the full size'),
 }, async (a) => {
   if (a.action === 'status') return text(recorder.status());
   if (a.action === 'stop') return text(await recorder.stop());
-  if (!(await findGame())) throw new Error('this session\'s game is not running: game_launch or dev_cycle first');
-  return text(a.action === 'clip' ? await recorder.clip(a) : await recorder.start(a));
+  const g = await findGame();
+  if (!g) throw new Error('this session\'s game is not running: game_launch or dev_cycle first');
+  let sized = null;
+  if (a.size) { const [w, h] = a.size.split('x').map(Number); sized = await setWindowSize(g, w, h); }
+  const r = a.action === 'clip' ? await recorder.clip(a) : await recorder.start(a);
+  return text(sized ? { window: sized, ...r } : r);
+});
+// Be.D.D. keeps the game's window off screen at whatever size it has; the game renders at that size.
+async function setWindowSize(g, width, height) {
+  if (width < 320 || height < 240 || width > 3840 || height > 2160) throw new Error('size: from 320x240 to 3840x2160');
+  const got = await resizeGameWindow(g.pid, width, height);
+  await call('window', {}, 10000).catch(() => {}); // Be.D.D. lays it out again (off screen, at the back)
+  await sleep(500); // the game resizes its swap chain on the next frames
+  return `${got.width}x${got.height}`;
+}
+reg('window_size', 'Set the size this session\'s game renders at (its hidden window\'s inner size), e.g. 1920x1080 or 1280x720 for 16:9 videos and screenshots. It stays while the game runs (a restart may bring back the default size). The window loses its title bar (it is off screen anyway).', { width: num, height: num }, async ({ width, height }) => {
+  const g = await findGame();
+  if (!g) throw new Error('this session\'s game is not running: game_launch or dev_cycle first');
+  return text({ window: await setWindowSize(g, width, height) });
 });
 reg('ui_read', 'Read the screen in front as text: controls with refs like [e1]. Covers menus, forms of the server (action/modal forms), chat, inventory screens. The HUD of in-game play is not read: use screenshot for that.', { find: z.string().optional(), ref: z.string().optional(), scope: z.string().optional(), maxNodes: num.optional() }, async (a) => {
   const r = await call('ui', a);
@@ -1496,7 +1534,7 @@ reg('interact_block', 'Use a block like a player would (right click): teleport n
   const tp = await serverCommand(`tp ${await target()} ${feet.x} ${feet.y} ${feet.z} ${yaw.toFixed(1)} ${pitch.toFixed(1)}`, { waitMs: 1500 });
   await sleep(300);
   await call('look', { yaw, pitch });
-  const b = await call('button', { button, action: 'click' }).catch((e) => ({ error: e.message }));
+  const b = await clickButton(button).catch((e) => ({ error: e.message }));
   await sleep(1200);
   let view = '';
   try { view = (await call('ui', { timeoutMs: 2000 })).view; } catch (e) { view = e.message; }
@@ -1508,8 +1546,13 @@ reg('move', 'Walk with the client for a time: x = strafe (-1..1, +1 = left), z =
   await sleep(ms + 100);
   return text({ input: r, world: await worldState() });
 });
-reg('hotbar', 'Select a hotbar slot 0..8.', { slot: num }, async (a) => text(await call('slot', a)));
-reg('mouse_button', 'Attack/use/pick on what the crosshair targets (click, or down/up to hold).', { button: z.enum(['attack', 'use', 'pick']), action: z.enum(['click', 'down', 'up']).optional(), holdTicks: num.optional() }, async (a) => text(await call('button', a)));
+// Be.D.D.'s slot op sometimes times out ("did not select the slot") although the number key works
+// (seen 2026-11-26 while recording): fall back to the key and check the selected slot.
+reg('hotbar', 'Select a hotbar slot 0..8.', { slot: num }, async ({ slot }) => text(await selectSlot(slot)));
+reg('mouse_button', 'Attack/use/pick on what the crosshair targets: click (press and release; holdTicks to hold longer, 20 ticks = 1 s), or down/up to hold.', { button: z.enum(['attack', 'use', 'pick']), action: z.enum(['click', 'down', 'up']).optional(), holdTicks: num.optional() }, async ({ button, action = 'click', holdTicks }) => {
+  if (action !== 'click') return text(await call('button', { button, action }));
+  return text(await clickButton(button, holdTicks));
+});
 reg('game_action', 'drop | dropAll | inventory | perspective | pause | swing.', { name: z.enum(['drop', 'dropAll', 'inventory', 'perspective', 'pause', 'swing']) }, async (a) => text(await call('action', a)));
 reg('key', 'Press/hold/release a key in the game window (names like E, ESC, ENTER, SPACE, LSHIFT, F1, SLASH, T, UP).', { key: z.string(), action: z.enum(['press', 'down', 'up']).optional(), holdMs: num.optional() }, async (a) => text(await call('key', a)));
 reg('type_text', 'Type characters into whatever has focus (a chat line, a text box).', { text: z.string() }, async (a) => text(await call('text', a)));
@@ -1795,7 +1838,7 @@ async function runStep(st) {
     case 'look_at': return lookAt(v);
     case 'look': return call('look', v);
     case 'attack': return typeof v === 'object' ? clientAttack(v.target, v.count ?? 1, v.gapMs, seqCloseScreens) : clientAttack(st.target, typeof v === 'number' ? v : 1, 450, seqCloseScreens);
-    case 'use': { await clearScreen(seqCloseScreens); if (v?.target) await lookAt(v.target); return call('button', { button: 'use', action: 'click' }); }
+    case 'use': { await clearScreen(seqCloseScreens); if (v?.target) await lookAt(v.target); return clickButton('use'); }
     case 'wait': await sleep(Math.min(+v, 120) * 1000); return { waited: +v };
     case 'screenshot': return { screenshot: typeof v === 'string' ? v : true };
     case 'ui_read': return { view: (await call('ui', {})).view };
@@ -1804,7 +1847,7 @@ async function runStep(st) {
     case 'command': return { output: await serverCommand(v, { waitMs: st.waitMs ?? 1500 }) };
     case 'chat': { await call('key', { key: 'T' }); await sleep(400); await call('text', { text: v }); await sleep(150); await call('key', { key: 'ENTER' }); return { said: v }; }
     case 'bot': return botCall(v, v.op === 'move' && v.wait ? (v.timeoutSec ?? 20) * 1000 + 5000 : 15000);
-    case 'hotbar': return call('slot', { slot: v });
+    case 'hotbar': return selectSlot(v);
     case 'jump': return call('input', { jump: true, ttlMs: 200 });
     case 'move': { const r = await call('input', { move: { x: v.x ?? 0, z: v.z ?? 0 }, jump: v.jump, sprint: v.sprint, sneak: v.sneak, ttlMs: v.ms ?? 1000 }); await sleep((v.ms ?? 1000) + 100); return r; }
     case 'tps': return botCall({ op: 'tps', seconds: typeof v === 'number' ? v : 5 }, 6000);
