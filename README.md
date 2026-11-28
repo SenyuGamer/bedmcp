@@ -237,6 +237,11 @@ The game renders at its hidden window's size (1024x722 by default). For 16:9 vid
 {width:1920, height:1080}` or `record {size:"1920x1080", maxWidth:1920}` resizes it first (the window
 loses its title bar so a 1080 p window fits a 1080 p screen). The capture rate is the game's own frame
 rate: heavy settings such as Vibrant Visuals at 1080 p give about 24 fps.
+`audio:true` (MP4) adds the game's own sound, and only that process's: Windows' process loopback
+(Windows 10 2004 or later) through a small helper, `src/procaudio.cs`, that bedmcp builds on first
+use with the .NET Framework's `csc.exe`. Be.D.D. keeps a game silent until its sound is turned on in
+the Be.D.D. manager window, so turn it on there first (the game then also plays on the speakers);
+`record` warns when the sound is off or nothing was heard.
 The skill tells Claude to record only when the user asks for a video.
 
 ## Limits

@@ -3,10 +3,19 @@
 // measured at 1024 px), and ffmpeg encodes them into an MP4 or a GIF, keeping the real time
 // between frames. Recording runs in the background, so other tools (move, ui_click,
 // bot ...) can act while it records.
-import { execFile } from 'node:child_process';
+//
+// Audio (audio:true, MP4 only): src/procaudio.cs records only the game process's sound with Windows'
+// process loopback (no microphone, no other programs), compiled on first use with the .NET
+// Framework's csc.exe. Be.D.D. keeps a game silent until its sound is turned on in its manager window.
+import { execFile, spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { safeRm } from './safefs.mjs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const AUDIO_SRC = join(dirname(fileURLToPath(import.meta.url)), 'procaudio.cs');
+const CSC = join(process.env.WINDIR ?? 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+const SILENT_NOTE = 'no game sound was captured: Be.D.D. keeps the game silent until its sound is turned on in the Be.D.D. manager window (ask the user to turn it on; the game then also plays on the speakers)';
 
 const run = (cmd, args, timeout) => new Promise((res) => {
   execFile(cmd, args, { windowsHide: true, maxBuffer: 16 << 20, timeout }, (err, stdout, stderr) => res({ code: err ? (err.code ?? 1) : 0, out: `${stdout}${stderr}` }));
@@ -23,8 +32,49 @@ async function sessionLocked() {
 const LOCKED_NOTE = 'the Windows session is locked: Windows throttles the game to ~1-2 fps, so the video will be choppy. Unlock the PC (keep it unlocked while recording; the monitor may be off)';
 const LOW_FPS = 10;
 
-export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
+export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg', gamePid = async () => null, binDir = join(outDir, '.bin') }) {
   let rec = null; // the recording in progress
+
+  // The audio helper, built from its source when missing or older.
+  async function audioExe() {
+    const exe = join(binDir, 'procaudio.exe');
+    if (existsSync(exe) && statSync(exe).mtimeMs >= statSync(AUDIO_SRC).mtimeMs) return exe;
+    if (!existsSync(CSC)) throw new Error(`audio needs the .NET Framework 4 compiler (${CSC}), which every Windows 10/11 has; it is missing here`);
+    mkdirSync(binDir, { recursive: true });
+    const r = await run(CSC, ['-nologo', '-optimize', '-platform:x64', '-target:exe', `-out:${exe}`, AUDIO_SRC], 120000);
+    if (r.code !== 0 || !existsSync(exe)) throw new Error(`could not build the audio helper: ${r.out.trim().slice(-600)}`);
+    return exe;
+  }
+
+  // Starts recording the game's sound; resolves once capture runs, with its start time (unix ms).
+  async function startAudio(r) {
+    const pid = await gamePid();
+    if (!pid) throw new Error('audio: the game\'s process is not known (is it running?)');
+    const exe = await audioExe();
+    const file = join(r.dir, 'audio.wav');
+    const proc = spawn(exe, [String(pid), file], { windowsHide: true });
+    const a = { proc, file, startMs: null, done: null, out: '' };
+    a.exited = new Promise((res) => proc.on('exit', (code) => res(code)));
+    proc.stdout.on('data', (d) => { a.out += d; });
+    proc.stderr.on('data', (d) => { a.out += d; });
+    const end = Date.now() + 10000;
+    while (Date.now() < end) {
+      const m = a.out.match(/^start (\d+)/m);
+      if (m) { a.startMs = Number(m[1]); return a; }
+      if (/^error /m.test(a.out) || proc.exitCode !== null) break;
+      await new Promise((res) => setTimeout(res, 50));
+    }
+    try { proc.kill(); } catch {}
+    throw new Error(`audio capture did not start: ${a.out.trim() || 'no answer in 10 s'}`);
+  }
+  async function stopAudio(a) {
+    try { a.proc.stdin.write('stop\n'); a.proc.stdin.end(); } catch {}
+    const code = await Promise.race([a.exited, new Promise((res) => setTimeout(() => res('timeout'), 15000))]);
+    if (code === 'timeout') { try { a.proc.kill(); } catch {} }
+    const m = a.out.match(/^done (\d+) (\d+)/m);
+    a.done = m ? { frames: Number(m[1]), peak: Number(m[2]) } : null;
+    return a.done;
+  }
 
   async function ffmpegOk() {
     const r = await run(ffmpeg, ['-version'], 15000);
@@ -66,9 +116,16 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
     mkdirSync(outDir, { recursive: true });
     const out = join(outDir, `${r.name}.${r.format}`);
     const even = 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+    // The sound, placed on the video's timeline: the video starts at the first frame's time.
+    let audioIn = [], audioOut = [];
+    if (r.format !== 'gif' && r.audio?.done?.frames) {
+      const off = (r.audio.startMs - frames[0].t) / 1000;
+      audioIn = [...(off >= 0 ? ['-itsoffset', off.toFixed(3)] : ['-ss', (-off).toFixed(3)]), '-i', r.audio.file];
+      audioOut = ['-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-shortest'];
+    }
     const args = r.format === 'gif'
       ? ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-vf', `fps=${Math.min(r.fps, 15)},scale=${Math.min(r.maxWidth, 640)}:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse`, out]
-      : ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-vf', `fps=30,${even}`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', out];
+      : ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, ...audioIn, '-vf', `fps=30,${even}`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', ...audioOut, '-movflags', '+faststart', out];
     const res = await run(ffmpeg, args, 300000);
     if (res.code !== 0 || !existsSync(out)) throw new Error(`ffmpeg failed (${res.code}): ${res.out.trim().split('\n').slice(-6).join(' | ')}`);
     return out;
@@ -77,6 +134,7 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
   async function finish(r) {
     r.stopping = true;
     await r.done;
+    if (r.audio) await stopAudio(r.audio);
     try {
       const file = await encode(r);
       const seconds = (r.ended - r.started) / 1000;
@@ -88,6 +146,10 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
           ? `capturedFps ${capturedFps}: ${LOCKED_NOTE}`
           : `capturedFps ${capturedFps} is low (the game rendered few frames): is the Windows session locked, the PC asleep, or the game minimized or throttled? Screenshots still work in those states.`;
       }
+      if (r.audio) {
+        out.audio = r.audio.done ? (r.format === 'gif' ? 'not in a GIF' : 'game sound only (48 kHz stereo AAC)') : `failed: ${r.audio.out.trim().slice(-300)}`;
+        if (r.audio.done && r.audio.done.peak === 0) out.warning = [out.warning, SILENT_NOTE].filter(Boolean).join('; ');
+      }
       return out;
     } finally {
       if (!r.keepFrames) safeRm(r.dir);
@@ -95,7 +157,7 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
     }
   }
 
-  async function start({ name, seconds = 60, fps = 30, maxWidth = 1280, quality = 75, format = 'mp4', keepFrames = false } = {}) {
+  async function start({ name, seconds = 60, fps = 30, maxWidth = 1280, quality = 75, format = 'mp4', keepFrames = false, audio = false } = {}) {
     if (rec) throw new Error(`already recording "${rec.name}" (${Math.round((Date.now() - rec.started) / 1000)} s): record {action:"stop"} first`);
     if (!(await ffmpegOk())) throw new Error(`ffmpeg not found (${ffmpeg}). Install it (winget install Gyan.FFmpeg) or set "ffmpeg" in the bedmcp config to its path.`);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -109,6 +171,12 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
     r.dir = join(outDir, '.frames', r.name);
     mkdirSync(r.dir, { recursive: true });
     r.lockedAtStart = await sessionLocked();
+    if (audio && format !== 'gif') {
+      try { r.audio = await startAudio(r); } catch (e) { safeRm(r.dir); throw e; }
+      // The helper may have been built just now: count the length from here.
+      const len = r.until - r.started;
+      r.started = Date.now(); r.until = r.started + len;
+    }
     r.done = loop(r);
     rec = r;
     return r;
@@ -118,7 +186,7 @@ export function createRecorder({ call, log, outDir, ffmpeg = 'ffmpeg' }) {
     // Starts a background recording; it ends by itself after `seconds` (max 600) or on stop().
     async start(opts) {
       const r = await start(opts);
-      return { recording: r.name, maxSeconds: Math.round((r.until - r.started) / 1000), fps: r.fps, note: 'recording in the background: act with the other tools, then record {action:"stop"} to get the file', ...(r.lockedAtStart ? { warning: LOCKED_NOTE } : {}) };
+      return { recording: r.name, maxSeconds: Math.round((r.until - r.started) / 1000), fps: r.fps, ...(r.audio ? { audio: 'recording the game\'s sound' } : {}), note:'recording in the background: act with the other tools, then record {action:"stop"} to get the file', ...(r.lockedAtStart ? { warning: LOCKED_NOTE } : {}) };
     },
     // Records `seconds` and waits for the file.
     async clip(opts) {

@@ -1498,14 +1498,15 @@ async function recordCall(op, fields, limit) {
   }
   try { return await recConn.call(op, fields, limit); } catch (e) { if (/no reply/.test(e.message)) { recConn.close(); recConn.closed = true; } throw e; }
 }
-const recorder = createRecorder({ call: recordCall, log, outDir: expandEnv(cfg.recordDir ?? join(STATE, 'recordings')), ffmpeg: expandEnv(cfg.ffmpeg ?? 'ffmpeg') });
-reg('record', 'Record a video (MP4 or GIF) of this session\'s game, for the user to watch. ONLY when the user asks for a video or recording; screenshots are enough otherwise. "clip" records `seconds` and returns the file; "start" records in the background while you act with other tools (move, ui_click, bot, dev_cycle ...), then "stop" returns the file; "status" tells what is recording. Frames are captured from the game itself, so it works with the window hidden and the monitor off (but not with the Windows session locked: then ~1-2 fps, and the result has a warning): ~25-30 fps captured (about 20+ distinct fps while moving, measured), no sound. Needs ffmpeg. Give the returned file to the user (e.g. send it as a file).', {
+const recorder = createRecorder({ call: recordCall, log, outDir: expandEnv(cfg.recordDir ?? join(STATE, 'recordings')), ffmpeg: expandEnv(cfg.ffmpeg ?? 'ffmpeg'), gamePid: async () => (await findGame())?.pid, binDir: join(STATE, 'bin') });
+reg('record', 'Record a video (MP4 or GIF) of this session\'s game, for the user to watch. ONLY when the user asks for a video or recording; screenshots are enough otherwise. "clip" records `seconds` and returns the file; "start" records in the background while you act with other tools (move, ui_click, bot, dev_cycle ...), then "stop" returns the file; "status" tells what is recording. Frames are captured from the game itself, so it works with the window hidden and the monitor off (but not with the Windows session locked: then ~1-2 fps, and the result has a warning): ~25-30 fps captured (about 20-25 distinct fps, the game\'s own frame rate), no sound unless audio:true. Needs ffmpeg. Give the returned file to the user (e.g. send it as a file).', {
   action: z.enum(['clip', 'start', 'stop', 'status']),
   seconds: num.optional().describe('clip: length; start: the most it records before stopping by itself (default 60, max 600)'),
   fps: num.optional().describe('frames per second to capture (default 30, max 30)'),
   format: z.enum(['mp4', 'gif']).optional().describe('mp4 (default) or gif (small, max 15 fps, 640 px wide)'),
   maxWidth: num.optional().describe('frame width in pixels (default 1280)'),
   name: z.string().optional().describe('a short name for the file, e.g. "shop-form"'),
+  audio: z.boolean().optional().describe('clip/start, MP4 only: also record the game\'s own sound (only the game process: no microphone, no other programs). Be.D.D. keeps the game silent until the user turns its sound on in the Be.D.D. manager window; the result warns when nothing was heard'),
   size: z.string().regex(/^\d{3,4}x\d{3,4}$/).optional().describe('clip/start: set the game window to this size first, e.g. "1920x1080" or "1280x720" for 16:9 (it stays; see window_size). Pass maxWidth too (e.g. 1920) to keep the full size'),
 }, async (a) => {
   if (a.action === 'status') return text(recorder.status());
@@ -1514,8 +1515,11 @@ reg('record', 'Record a video (MP4 or GIF) of this session\'s game, for the user
   if (!g) throw new Error('this session\'s game is not running: game_launch or dev_cycle first');
   let sized = null;
   if (a.size) { const [w, h] = a.size.split('x').map(Number); sized = await setWindowSize(g, w, h); }
+  // Be.D.D.'s window op tells whether the game's sound is on (only its manager window turns it on).
+  let muted = null;
+  if (a.audio) { try { if ((await call('window', {}, 10000)).audio === false) muted = 'the game\'s sound is off in Be.D.D.: the video will be silent unless the user turns it on in the Be.D.D. manager window now'; } catch {} }
   const r = a.action === 'clip' ? await recorder.clip(a) : await recorder.start(a);
-  return text(sized ? { window: sized, ...r } : r);
+  return text({ ...(sized ? { window: sized } : {}), ...(muted ? { soundOff: muted } : {}), ...r });
 });
 // Be.D.D. keeps the game's window off screen at whatever size it has; the game renders at that size.
 async function setWindowSize(g, width, height) {
